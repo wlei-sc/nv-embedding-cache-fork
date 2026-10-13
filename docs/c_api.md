@@ -285,6 +285,9 @@ Factory config options (`nve_create_table_factory`):
 | `password` | `""` | Plaintext password. |
 | `keep_alive` | `true` | Keep TCP connections alive. |
 | `connections_per_node` | `5` | Max parallel connections per Redis node. In standalone string mode set this `≥ num_partitions` so the parallel work isn't bottlenecked on the pool. |
+| `connect_timeout_ms` | `0` | Timeout for establishing a connection, in ms. `0` waits forever. |
+| `socket_timeout_ms` | `0` | Timeout for each read or write on a connection, which bounds a command, in ms. `0` waits forever. |
+| `pool_wait_timeout_ms` | `0` | How long a command waits for a free pooled connection when all are in use, in ms. `0` waits forever. |
 | `use_tls` | `false` | Encrypt connections with TLS (with `ca_certificate`, `client_certificate`, `client_key`, `server_name_identification`). |
 
 Table config options (`nve_table_factory_produce`), in addition to the common fields above:

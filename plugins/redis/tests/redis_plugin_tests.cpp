@@ -71,7 +71,8 @@ TEST(redis_plugin, parse_table_conf) {
 TEST(redis_plugin, parse_factory_conf) {
   const RedisClusterTableFactoryConfig conf{
       {},    "localhost:7000", "admin",       "12345",      true /*single_node*/, false,   3,
-      true,  "my_bundle.crt",  "my_cert.pem", "my_key.pem", "my_sni"};
+      true,  "my_bundle.crt",  "my_cert.pem", "my_key.pem", "my_sni",
+      100 /*connect_timeout_ms*/, 200 /*socket_timeout_ms*/, 50 /*pool_wait_timeout_ms*/};
   std::cout << static_cast<nlohmann::json>(conf) << '\n';
 
   nlohmann::json json(R"({
@@ -87,7 +88,11 @@ TEST(redis_plugin, parse_factory_conf) {
     "ca_certificate": "my_bundle.crt",
     "client_certificate": "my_cert.pem",
     "client_key": "my_key.pem",
-    "server_name_identification": "my_sni"
+    "server_name_identification": "my_sni",
+
+    "connect_timeout_ms": 100,
+    "socket_timeout_ms": 200,
+    "pool_wait_timeout_ms": 50
   })"_json);
   ASSERT_TRUE(is_json_subset(json, static_cast<nlohmann::json>(conf)));
 
