@@ -1105,7 +1105,7 @@ int64_t RedisClusterTable<KeyType, MetaType, PartitionerType>::find_(
         // Run query if the batch is about to overflow.
         if NVE_UNLIKELY_(static_cast<int64_t>(k_views.size()) + bitmask64::count(it) >
                          max_batch_size) {
-          cluster->mget(k_views.begin(), k_views.end(), parser_t(callback));
+          cluster->kp_mget(k_views.begin(), k_views.end(), parser_t(callback));
           k_views.clear();
           view_to_ij.clear();
         }
@@ -1122,7 +1122,7 @@ int64_t RedisClusterTable<KeyType, MetaType, PartitionerType>::find_(
         }
       }
       if (!k_views.empty()) {
-        cluster->mget(k_views.begin(), k_views.end(), parser_t(callback));
+        cluster->kp_mget(k_views.begin(), k_views.end(), parser_t(callback));
       }
 
       total_num_hits.fetch_add(num_hits, std::memory_order_relaxed);
