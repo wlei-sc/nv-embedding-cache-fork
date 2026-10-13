@@ -76,6 +76,27 @@ class RedisConn final {
   NVE_REDIS_FWD_(hincrby)
 #undef NVE_REDIS_FWD_
 
+  // KP.MGET: a drop-in for MGET (same key list in, same array-of-values reply
+  // out) that some Redis proxies serve in its place. String mode is always backed
+  // by a standalone connection, so the raw command goes out on `standalone_`:
+  // build "KP.MGET" + the key range via CmdArgs, send, and parse the array reply
+  // through the same output iterator MGET uses, so callers swap `mget` ->
+  // `kp_mget` with no other change. Requires a server that implements KP.MGET.
+  template <typename Input, typename Output>
+  void kp_mget(Input first, Input last, Output output) const {
+    NVE_CHECK_(is_single_node(),
+               "KP.MGET is only supported in single-node (string) mode.");
+    auto reply = standalone_->command(
+        [](sw::redis::Connection &connection, Input f, Input l) {
+          sw::redis::CmdArgs args;
+          args << "KP.MGET" << std::make_pair(f, l);
+          connection.send(args);
+        },
+        first, last);
+    NVE_CHECK_(reply != nullptr, "KP.MGET returned a null reply from Redis.");
+    sw::redis::reply::to_array(*reply, output);
+  }
+
   // Cluster pipelines require a hash-tag for slot routing; standalone pipelines ignore it.
   sw::redis::Pipeline pipeline(const sw::redis::StringView& hash_tag) {
     if (cluster_) {
