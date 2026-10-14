@@ -490,6 +490,16 @@ int64_t HierarchicalEmbeddingLayer<KeyType>::get_num_tables() const {
   return static_cast<int64_t>(tables_.size());
 }
 
+template <typename KeyType>
+void HierarchicalEmbeddingLayer<KeyType>::set_cache_missed_keys(const bool enable) {
+  NVE_CHECK_(!enable || !config_.default_embedding.empty(),
+             "Caching missed keys requires a default embedding");
+  // Not the last table: it's the backing store the misses came from.
+  for (size_t i = 0; i + 1 < auto_insert_handlers_.size(); i++) {
+    auto_insert_handlers_.at(i)->set_keep_missed_keys(enable);
+  }
+}
+
 // Instantiate versions of HierarchicalEmbeddingLayer (todo: add more)
 template class HierarchicalEmbeddingLayer<int32_t>;
 template class HierarchicalEmbeddingLayer<int64_t>;

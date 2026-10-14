@@ -176,9 +176,9 @@ void AutoInsertHandler::collect_keys_and_data(
 
   // Make the hitmask host-visible so we can rewrite missed keys to the sentinel after the sync below.
   // access_buffer queues a D2H copy on lookup_stream when the last access was on device, so it's covered
-  // by the existing stream sync.
+  // by the existing stream sync. Kept missed keys need no rewrite: their rows hold the default embedding.
   bitmask64_t* h_hitmask = nullptr;
-  if (hitmask_bw) {
+  if (hitmask_bw && !keep_missed_keys_) {
     h_hitmask = hitmask_bw->access_buffer(cudaMemoryTypeHost, true /*copy_content*/, lookup_stream);
   }
 
@@ -217,6 +217,12 @@ void AutoInsertHandler::lock_modify() {
   if (heuristic_) {
     insert_lock_.lock();
   }
+}
+
+void AutoInsertHandler::set_keep_missed_keys(const bool keep) {
+  // Waits for an insert in progress, which holds the lock until it completes.
+  std::lock_guard<TestableMutex> lock(insert_lock_);
+  keep_missed_keys_ = keep;
 }
 
 void AutoInsertHandler::unlock_modify() {
