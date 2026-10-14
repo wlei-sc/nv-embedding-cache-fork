@@ -80,6 +80,16 @@ class HierarchicalEmbeddingLayer : public EmbeddingLayerBase {
     cudaStream_t lookup_stream, cudaStream_t modify_stream, thread_pool_ptr_t thread_pool, allocator_ptr_t allocator) override;
   int64_t get_num_tables() const override;
 
+  /**
+   * Keeps keys missing from every table in the cache tables (all tables but the last).
+   * Auto-insert then stores such a key under its own key, with the default embedding as its row,
+   * instead of dropping it, so later lookups resolve it from the caches like any other key rather
+   * than asking the last table again. The last table, the backing store the misses came from,
+   * never receives them. Off by default. Requires a `default_embedding`. Call before the first
+   * lookup.
+   */
+  void set_cache_missed_keys(bool enable);
+
   inline const Config& get_config() const { return config_; }
 
  private:

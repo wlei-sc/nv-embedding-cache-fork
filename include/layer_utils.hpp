@@ -285,6 +285,10 @@ public:
   void lock_modify();
   void unlock_modify();
 
+  // When true, keys that missed every table are inserted under their own key instead of being
+  // rewritten to the invalid key. Their rows must already hold the layer's default embedding.
+  void set_keep_missed_keys(bool keep);
+
 private:
   TestableMutex insert_lock_; // lock to prevent parallel auto-insert handling and modify parallel to auto-insert
   std::shared_ptr<InsertHeuristic> heuristic_;
@@ -302,6 +306,7 @@ private:
   int64_t collected_keys_{0};
   int64_t collected_output_stride_{0};
   bool collection_is_uvm_{false}; // sticky per-collection: insert the collected keys via uvm_insert_fn_
+  bool keep_missed_keys_{false}; // see set_keep_missed_keys; guarded by insert_lock_
 
   // Handler keeps it own keys/data buffers for accumulation of small key sets
   std::unique_ptr<ResizeableBuffer> insert_keys_;
