@@ -19,8 +19,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <future>
 #include <thread>
 #include <thread_pool.hpp>
+#include <vector>
 
 using namespace std::chrono_literals;
 using namespace nve;
@@ -412,4 +416,76 @@ TEST(InlineThreadPool, ExceptionCapturedInFuture) {
   EXPECT_THROW(res.get(), std::runtime_error);
   EXPECT_THROW(tp->execute_n(0, 3, [](int64_t i) { if (i == 1) throw std::runtime_error("boom"); }),
                std::runtime_error);
+}
+
+// Runs `f`, which must finish within `limit`. A deadlocked pool can't be unwound, so a hang is
+// reported and the test binary exits instead of hanging.
+template <typename F>
+static void RunWithin(const std::chrono::seconds limit, const char* what, F&& f) {
+  auto done{std::async(std::launch::async, std::forward<F>(f))};
+  if (done.wait_for(limit) != std::future_status::ready) {
+    std::fprintf(stderr, "DEADLOCK: %s did not finish within %lld s\n", what,
+                 static_cast<long long>(limit.count()));
+    std::fflush(stderr);
+    std::_Exit(1);
+  }
+  done.get();
+}
+
+// A task on a pool worker that waits on more work for the same pool (execute_n, as the host
+// tables' insert and find do) must not deadlock, even holding the pool's only worker.
+static void ExpectNestedExecuteOnOnlyWorker(const thread_pool_ptr_t& tp) {
+  std::atomic<int64_t> inner{0};
+  RunWithin(20s, "a nested execute_n on a one-worker pool", [&] {
+    tp->submit([&] { tp->execute_n(0, 4, [&](int64_t) { inner++; }); }).get();
+  });
+  EXPECT_EQ(inner, 4);
+}
+
+// Every worker waiting on nested work at once: each outer task waits until all of them hold a
+// worker, then waits on execute_n. Without the fix no worker is left to run the inner tasks.
+static void ExpectNestedExecuteOnEveryWorker(const thread_pool_ptr_t& tp) {
+  const int64_t workers{tp->num_workers()};
+  std::atomic<int64_t> started{0};
+  std::atomic<int64_t> inner{0};
+  RunWithin(20s, "a nested execute_n on every worker", [&] {
+    std::vector<ThreadPool::result_type> outer;
+    for (int64_t i{}; i < workers; ++i) {
+      // Spread over the workgroups, so every worker takes one.
+      outer.push_back(tp->submit(
+          [&] {
+            started++;
+            while (started.load() < workers) std::this_thread::yield();
+            tp->execute_n(0, 2, [&](int64_t) { inner++; });
+          },
+          i % tp->num_workgroups()));
+    }
+    for (auto& res : outer) res.get();
+  });
+  EXPECT_EQ(inner, 2 * workers);
+}
+
+TEST(SimpleThreadPool, NestedExecuteOnOnlyWorker) {
+  ExpectNestedExecuteOnOnlyWorker(create_thread_pool(R"({"name": "tp", "num_workers": 1})"_json));
+}
+
+TEST(SimpleThreadPool, NestedExecuteOnEveryWorker) {
+  ExpectNestedExecuteOnEveryWorker(create_thread_pool(R"({"name": "tp", "num_workers": 4})"_json));
+}
+
+TEST(NumaThreadPool, NestedExecuteOnOnlyWorker) {
+  ExpectNestedExecuteOnOnlyWorker(create_thread_pool(R"({
+    "implementation": "numa",
+    "workgroups": [{"cpu_socket_index": -1, "numa_node_index": 0, "num_workers": 1}]
+  })"_json));
+}
+
+TEST(NumaThreadPool, NestedExecuteOnEveryWorker) {
+  ExpectNestedExecuteOnEveryWorker(create_thread_pool(R"({
+    "implementation": "numa",
+    "workgroups": [
+      {"cpu_socket_index": -1, "numa_node_index": 0, "num_workers": 2},
+      {"cpu_socket_index": -1, "numa_node_index": 0, "num_workers": 2}
+    ]
+  })"_json));
 }
