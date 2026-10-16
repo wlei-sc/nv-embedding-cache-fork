@@ -59,6 +59,18 @@ void ContextRegistry::update_streams() {
   }
 }
 
+HierarchicalAsyncLookup::~HierarchicalAsyncLookup() {
+  if (task.valid()) {
+    task.wait();  // the task writes this context's buffers; a throw stays in the future
+  }
+  if (copied != nullptr) {
+    const cudaError_t res = cudaEventDestroy(copied);
+    if (res != cudaSuccess && !cuda_runtime_unloading(res, "async lookup event destroy")) {
+      NVE_LOG_ERROR_("cudaEventDestroy failed: ", cudaGetErrorString(res));
+    }
+  }
+}
+
 AutoInsertHandler::AutoInsertHandler(
   std::shared_ptr<InsertHeuristic> heuristic,
   table_ptr_t table,

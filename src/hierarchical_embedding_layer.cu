@@ -29,6 +29,9 @@
 #include <insert_heuristic.hpp>
 #include <buffer_wrapper.hpp>
 #include <cuda_support.hpp>
+#include <thread_pool.hpp>
+#include <chrono>
+#include <cstring>
 
 namespace nve {
 
@@ -497,6 +500,259 @@ void HierarchicalEmbeddingLayer<KeyType>::set_cache_missed_keys(const bool enabl
   // Not the last table: it's the backing store the misses came from.
   for (size_t i = 0; i + 1 < auto_insert_handlers_.size(); i++) {
     auto_insert_handlers_.at(i)->set_keep_missed_keys(enable);
+  }
+}
+
+namespace {
+
+using AsyncClock = std::chrono::steady_clock;
+
+int64_t elapsed_ns(const AsyncClock::time_point from, const AsyncClock::time_point to) {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count();
+}
+
+HierarchicalAsyncLookup& async_state(const context_ptr_t& ctx) {
+  auto* layer_ctx = dynamic_cast<LayerExecutionContext*>(ctx.get());
+  NVE_CHECK_(layer_ctx != nullptr, "Invalid layer context");
+  NVE_CHECK_(layer_ctx->async_lookup_ != nullptr, "No async lookup was begun on this context");
+  return *layer_ctx->async_lookup_;
+}
+
+}  // namespace
+
+template <typename KeyType>
+bool HierarchicalEmbeddingLayer<KeyType>::supports_async_lookup() const {
+  // lookup()'s scatter case: a GPU table first, then host tables only, which the task reads and
+  // writes on host memory.
+  if (tables_.size() < 2 || tables_.front()->get_device_id() < 0) {
+    return false;
+  }
+  for (size_t i = 1; i < tables_.size(); i++) {
+    if (tables_[i]->get_device_id() >= 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+template <typename KeyType>
+void HierarchicalEmbeddingLayer<KeyType>::lookup_async_begin(context_ptr_t& ctx,
+                                                             const int64_t num_keys,
+                                                             const void* keys, void* output,
+                                                             const int64_t output_stride,
+                                                             const bool defer_last_table) {
+  NVE_NVTX_SCOPED_FUNCTION_COL1_();
+  NVE_CHECK_(supports_async_lookup(), "This layer's tables don't support async lookups");
+  ScopedDevice scope_device(gpu_device_);
+  auto layer_ctx = std::dynamic_pointer_cast<LayerExecutionContext>(ctx);
+  NVE_CHECK_(layer_ctx != nullptr, "Invalid layer context");
+  const cudaStream_t stream = layer_ctx->get_lookup_stream();
+
+  auto& state = layer_ctx->async_lookup_;
+  if (state == nullptr) {
+    state = std::make_unique<HierarchicalAsyncLookup>();
+    NVE_CHECK_(cudaEventCreateWithFlags(&state->copied, cudaEventDisableTiming));
+    // The task runs the host tables' finds on its own thread: their execute_n, waiting on pool
+    // workers from a pool worker, could otherwise deadlock the pool.
+    const thread_pool_ptr_t inline_pool{InlineThreadPool::instance()};
+    state->table_contexts.resize(tables_.size());
+    for (size_t i = 1; i < tables_.size(); i++) {
+      state->table_contexts[i] = tables_[i]->create_execution_context(
+          stream, layer_ctx->get_modify_stream(), inline_pool, layer_ctx->get_allocator());
+      NVE_CHECK_(state->table_contexts[i] != nullptr, "Failed to create table execution context");
+    }
+  }
+  HierarchicalAsyncLookup& a = *state;
+  NVE_CHECK_(!a.task.valid() && !a.completed, "An async lookup is already in flight on this context");
+  NVE_CHECK_(output_stride >= tables_.at(0)->get_max_row_size(), "Output stride below the row size");
+
+  a.num_keys = num_keys;
+  a.output = output;
+  a.output_stride = output_stride;
+  a.defer_last = defer_last_table;
+  a.table_hits.assign(tables_.size(), 0);
+  a.stats = AsyncLookupStats{};
+  a.stats.find_ns.assign(tables_.size(), 0);
+  if (num_keys <= 0) {
+    return;
+  }
+
+  // Everything the task touches is allocated here, since an allocation can synchronize. The names
+  // differ from lookup()'s, so a synchronous lookup on this context leaves them alone.
+  const auto key_bytes = sizeof(KeyType) * to_uint(num_keys);
+  const auto mask_bytes = to_uint(ceil_div(num_keys, bitmask64::num_bits)) * sizeof(bitmask64_t);
+  const auto row_bytes = to_uint(num_keys * output_stride);
+  a.keys_h = ctx->get_buffer("async_keys", key_bytes, true /*host_alloc*/);
+  a.hitmask_d = static_cast<bitmask64_t*>(ctx->get_buffer("async_hitmask", mask_bytes, false));
+  a.hitmask_h = static_cast<bitmask64_t*>(ctx->get_buffer("async_hitmask", mask_bytes, true));
+  a.rows_h = ctx->get_buffer("async_rows", row_bytes, true /*host_alloc*/);
+  a.staging_d = auto_insert_handlers_.empty()
+                    ? nullptr
+                    : ctx->get_buffer("async_staging", row_bytes, false /*host_alloc*/);
+
+  // ① The GPU table's find, as lookup() runs it.
+  NVE_CHECK_(cudaMemsetAsync(a.hitmask_d, 0, mask_bytes, stream));
+  auto keys_bw = std::make_shared<BufferWrapper<const void>>(ctx, "keys", keys, key_bytes);
+  auto hitmask_bw = std::make_shared<BufferWrapper<bitmask64_t>>(ctx, "hitmask", a.hitmask_d, mask_bytes);
+  auto output_bw = std::make_shared<BufferWrapper<void>>(ctx, "output", output, row_bytes);
+  tables_[0]->find(layer_ctx->table_contexts_.at(0), num_keys, keys_bw, hitmask_bw, output_stride,
+                   output_bw, nullptr /*value_sizes*/);
+
+  // ② The keys and the GPU table's hits to the host, for the task.
+  NVE_CHECK_(cudaMemcpyAsync(a.keys_h, keys, key_bytes, cudaMemcpyDefault, stream));
+  NVE_CHECK_(cudaMemcpyAsync(a.hitmask_h, a.hitmask_d, mask_bytes, cudaMemcpyDefault, stream));
+  NVE_CHECK_(cudaEventRecord(a.copied, stream));
+
+  a.submitted = AsyncClock::now();
+  a.task = layer_ctx->get_thread_pool()->submit([this, &a] { run_async_host_stage(a); });
+}
+
+template <typename KeyType>
+void HierarchicalEmbeddingLayer<KeyType>::run_async_host_stage(HierarchicalAsyncLookup& a) const {
+  const auto started = AsyncClock::now();
+  a.stats.queue_ns = elapsed_ns(a.submitted, started);
+  ScopedDevice scope_device(gpu_device_);
+  NVE_CHECK_(cudaEventSynchronize(a.copied));
+  a.stats.wait_ns = elapsed_ns(started, AsyncClock::now());
+
+  const int64_t num_keys = a.num_keys;
+  const int64_t num_words = ceil_div(num_keys, bitmask64::num_bits);
+  // The GPU table's hits are the bits set so far (lookup() reads its miss counter instead, which
+  // would cost a stream sync here).
+  for (int64_t w = 0; w < num_words; w++) {
+    a.table_hits[0] += bitmask64::count(a.hitmask_h[w]);
+  }
+
+  // ③ ④ The host tables and the backing store (unless deferred), through wrappers of host memory:
+  // no copies, no stream work.
+  const auto key_bytes = sizeof(KeyType) * to_uint(num_keys);
+  const auto mask_bytes = to_uint(num_words) * sizeof(bitmask64_t);
+  const auto row_bytes = to_uint(num_keys * a.output_stride);
+  context_ptr_t& wrap_ctx = a.table_contexts.at(1);
+  auto keys_bw = std::make_shared<BufferWrapper<const void>>(wrap_ctx, "async_keys", a.keys_h, key_bytes);
+  auto hitmask_bw = std::make_shared<BufferWrapper<bitmask64_t>>(wrap_ctx, "async_hitmask", a.hitmask_h, mask_bytes);
+  auto rows_bw = std::make_shared<BufferWrapper<void>>(wrap_ctx, "async_rows", a.rows_h, row_bytes);
+  const size_t num_tables = a.defer_last ? tables_.size() - 1 : tables_.size();
+  for (size_t i = 1; i < num_tables; i++) {
+    const auto t0 = AsyncClock::now();
+    context_ptr_t& table_ctx = a.table_contexts[i];
+    tables_[i]->reset_lookup_counter(table_ctx);
+    tables_[i]->find(table_ctx, num_keys, keys_bw, hitmask_bw, a.output_stride, rows_bw,
+                     nullptr /*value_sizes*/);
+    tables_[i]->get_lookup_counter(table_ctx, &a.table_hits[i]);
+    a.stats.find_ns[i] = elapsed_ns(t0, AsyncClock::now());
+  }
+
+  // ⑤ Default rows for the keys every table missed, inline (no execute_n from a pool worker).
+  // Deferred, these are the keys left to the caller, who overwrites the rows it finds.
+  if (!config_.default_embedding.empty()) {
+    const auto t0 = AsyncClock::now();
+    const uint8_t* default_row = config_.default_embedding.data();
+    const size_t row_size = config_.default_embedding.size();
+    auto* rows = static_cast<uint8_t*>(a.rows_h);
+    for (int64_t k = 0; k < num_keys; k++) {
+      if (!bitmask64::get(a.hitmask_h[k / bitmask64::num_bits], k % bitmask64::num_bits)) {
+        std::memcpy(rows + k * a.output_stride, default_row, row_size);
+      }
+    }
+    a.stats.default_ns = elapsed_ns(t0, AsyncClock::now());
+  }
+  a.stats.task_ns = elapsed_ns(a.submitted, AsyncClock::now());
+}
+
+template <typename KeyType>
+AsyncDeferredFind HierarchicalEmbeddingLayer<KeyType>::lookup_async_deferred(context_ptr_t& ctx) {
+  NVE_NVTX_SCOPED_FUNCTION_COL1_();
+  HierarchicalAsyncLookup& a = async_state(ctx);
+  NVE_CHECK_(a.defer_last && !a.completed, "No deferred async lookup is in flight on this context");
+  if (a.task.valid()) {
+    a.task.get();  // rethrows the task's error
+  }
+  return {a.num_keys, a.keys_h, a.hitmask_h, a.rows_h, a.output_stride,
+          tables_.back()->get_max_row_size()};
+}
+
+template <typename KeyType>
+void HierarchicalEmbeddingLayer<KeyType>::lookup_async_complete(context_ptr_t& ctx,
+                                                                const int64_t deferred_hits) {
+  NVE_NVTX_SCOPED_FUNCTION_COL1_();
+  HierarchicalAsyncLookup& a = async_state(ctx);
+  NVE_CHECK_(!a.completed, "This async lookup was already completed");
+  if (a.task.valid()) {
+    a.task.get();  // rethrows the task's error
+  }
+  if (a.defer_last) {
+    a.table_hits.back() = deferred_hits;
+  }
+  if (a.num_keys > 0) {
+    ScopedDevice scope_device(gpu_device_);
+    const cudaStream_t stream = ctx->get_lookup_stream();
+    const auto row_size = static_cast<uint32_t>(tables_.at(0)->get_max_row_size());
+    const auto stride = static_cast<uint32_t>(a.output_stride);
+    // ⑥ As in lookup(): every row the GPU table missed comes from the host rows.
+    EmbeddingForwardScatter(a.rows_h, a.output, row_size, stride, stride,
+                            reinterpret_cast<const uint64_t*>(a.hitmask_d),
+                            static_cast<int32_t>(a.num_keys), stream);
+    if (a.staging_d != nullptr) {
+      NVE_CHECK_(cudaMemcpyAsync(a.staging_d, a.output, to_uint(a.num_keys * a.output_stride),
+                                 cudaMemcpyDefault, stream));
+    }
+  }
+  a.completed = true;
+}
+
+template <typename KeyType>
+void HierarchicalEmbeddingLayer<KeyType>::lookup_async_finish(context_ptr_t& ctx, float* hitrates,
+                                                              AsyncLookupStats* stats) {
+  NVE_NVTX_SCOPED_FUNCTION_COL1_();
+  HierarchicalAsyncLookup& a = async_state(ctx);
+  if (!a.completed) {
+    // complete was skipped or threw: only join the task before its buffers are reused.
+    if (a.task.valid()) {
+      a.task.wait();
+      a.task = {};
+    }
+    return;
+  }
+  a.completed = false;
+  if (stats != nullptr) {
+    *stats = a.stats;
+  }
+  const int64_t num_keys = a.num_keys;
+  if (num_keys <= 0) {
+    return;
+  }
+
+  // Hit rates and ⑦ the cache fill, as lookup() computes them.
+  std::vector<float> table_hitrates(tables_.size());
+  int64_t left_keys = num_keys;
+  for (size_t i = 0; i < tables_.size(); i++) {
+    int64_t hits = a.table_hits[i];
+    const bool deferred = a.defer_last && i + 1 == tables_.size();  // the caller counted hits
+    if (i > 0 && !deferred && !tables_[i]->lookup_counter_hits()) {
+      hits = left_keys - hits;  // the table counts misses
+    }
+    table_hitrates[i] = (left_keys > 0) ? static_cast<float>(hits) / static_cast<float>(left_keys) : 1.0f;
+    if (hitrates != nullptr) {
+      hitrates[i] = static_cast<float>(hits) / static_cast<float>(num_keys);
+    }
+    left_keys -= hits;
+  }
+  if (auto_insert_handlers_.empty()) {
+    return;
+  }
+  ScopedDevice scope_device(gpu_device_);
+  auto layer_ctx = std::dynamic_pointer_cast<LayerExecutionContext>(ctx);
+  const auto key_bytes = sizeof(KeyType) * to_uint(num_keys);
+  const auto mask_bytes = to_uint(ceil_div(num_keys, bitmask64::num_bits)) * sizeof(bitmask64_t);
+  const auto row_bytes = to_uint(num_keys * a.output_stride);
+  // The staged rows stand in for the output, which the model has overwritten by now.
+  auto keys_bw = std::make_shared<BufferWrapper<const void>>(ctx, "async_keys", a.keys_h, key_bytes);
+  auto rows_bw = std::make_shared<BufferWrapper<void>>(ctx, "async_staging", a.staging_d, row_bytes);
+  auto hitmask_bw = std::make_shared<BufferWrapper<bitmask64_t>>(ctx, "async_hitmask", a.hitmask_h, mask_bytes);
+  for (size_t i = 0; i < table_hitrates.size(); i++) {
+    auto_insert_handlers_.at(i)->auto_insert(layer_ctx, keys_bw, rows_bw, table_hitrates[i], num_keys,
+                                             a.output_stride, (left_keys > 0) ? hitmask_bw : nullptr);
   }
 }
 
