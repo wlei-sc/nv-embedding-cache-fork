@@ -117,10 +117,56 @@ private:
   const cudaStream_t caller_stream_;
 };
 
+// Timings of an async lookup's host task (HierarchicalEmbeddingLayer::lookup_async_*), host
+// wall-clock, for observability.
+struct AsyncLookupStats {
+  int64_t queue_ns = 0;          // submitted until a worker started it
+  int64_t wait_ns = 0;           // waiting for the keys and GPU hit mask to reach the host
+  std::vector<int64_t> find_ns;  // per table; 0 for the GPU table, whose find runs in begin
+  int64_t default_ns = 0;        // filling default rows
+  int64_t task_ns = 0;           // submitted until done
+};
+
+// The last table's find that an async lookup begun with `defer_last_table` leaves to the caller,
+// on host memory (HierarchicalEmbeddingLayer::lookup_async_deferred).
+struct AsyncDeferredFind {
+  int64_t num_keys{};
+  const void* keys{};
+  bitmask64_t* hit_mask{};  // set bits: resolved by the tables above; the caller sets the ones it finds
+  void* values{};           // row i at values + i * value_stride, holding the default row until found
+  int64_t value_stride{};
+  int64_t value_size{};     // the table's row size
+};
+
+// A HierarchicalEmbeddingLayer's in-flight async lookup on one context (lookup_async_begin until
+// lookup_async_finish). The buffers are the context's, so they stay valid for its lifetime.
+struct HierarchicalAsyncLookup {
+  NVE_PREVENT_COPY_AND_MOVE_(HierarchicalAsyncLookup);
+  HierarchicalAsyncLookup() = default;
+  ~HierarchicalAsyncLookup();  // waits for the task; never throws
+
+  int64_t num_keys{};
+  void* output{};  // the caller's device output
+  int64_t output_stride{};
+  void* keys_h{};              // pinned host copy of the keys
+  bitmask64_t* hitmask_d{};    // the GPU table's hits; the scatter reads it
+  bitmask64_t* hitmask_h{};    // host copy: the GPU table's hits, then every table's
+  void* rows_h{};              // pinned host rows the host tables and default rows fill
+  void* staging_d{};           // final rows, copied for the cache fill (null without one)
+  cudaEvent_t copied{};        // keys and GPU hit mask have reached the host
+  std::vector<context_ptr_t> table_contexts;  // per table; [i >= 1] run on an inline pool
+  std::chrono::steady_clock::time_point submitted;
+  std::future<void> task;
+  std::vector<int64_t> table_hits;
+  AsyncLookupStats stats;
+  bool defer_last{false};  // the caller runs the last table's find
+  bool completed{false};
+};
+
 class LayerExecutionContext: public ExecutionContext {
  public:
   NVE_PREVENT_COPY_AND_MOVE_(LayerExecutionContext);
-  
+
   LayerExecutionContext(
     cudaStream_t lookup_stream,
     cudaStream_t modify_stream,
@@ -174,6 +220,9 @@ class LayerExecutionContext: public ExecutionContext {
   // For now only auto-insert can be offloaded and only one can exist at a given time for every table
   // todo: extend to multiple futures when needed.
   std::vector<ThreadPool::result_type> parallel_task_res_;
+  // HierarchicalEmbeddingLayer's async lookup on this context, created by its first one. Its
+  // destructor joins a running task, which uses this context's buffers (freed after it).
+  std::unique_ptr<HierarchicalAsyncLookup> async_lookup_;
 
  private:
   // Reap all finished async tasks (they queue work on the streams, so this must precede the stream
