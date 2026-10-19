@@ -15,14 +15,23 @@
  * limitations under the License.
  */
 
+#include <arpa/inet.h>
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <buffer_wrapper.hpp>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <execution_context.hpp>
+#include <future>
 #include <host_table.hpp>
 #include <json_support.hpp>
 #include <numeric>
 #include <redis_cluster_table.hpp>
+#include <string>
 #include <vector>
 
 using namespace nve;
@@ -71,7 +80,8 @@ TEST(redis_plugin, parse_table_conf) {
 TEST(redis_plugin, parse_factory_conf) {
   const RedisClusterTableFactoryConfig conf{
       {},    "localhost:7000", "admin",       "12345",      true /*single_node*/, false,   3,
-      true,  "my_bundle.crt",  "my_cert.pem", "my_key.pem", "my_sni"};
+      true,  "my_bundle.crt",  "my_cert.pem", "my_key.pem", "my_sni",
+      100 /*connect_timeout_ms*/, 200 /*socket_timeout_ms*/, 50 /*pool_wait_timeout_ms*/};
   std::cout << static_cast<nlohmann::json>(conf) << '\n';
 
   nlohmann::json json(R"({
@@ -87,12 +97,84 @@ TEST(redis_plugin, parse_factory_conf) {
     "ca_certificate": "my_bundle.crt",
     "client_certificate": "my_cert.pem",
     "client_key": "my_key.pem",
-    "server_name_identification": "my_sni"
+    "server_name_identification": "my_sni",
+
+    "connect_timeout_ms": 100,
+    "socket_timeout_ms": 200,
+    "pool_wait_timeout_ms": 50
   })"_json);
   ASSERT_TRUE(is_json_subset(json, static_cast<nlohmann::json>(conf)));
 
   RedisClusterTableFactoryConfig parsed_conf(json);
   ASSERT_EQ(static_cast<nlohmann::json>(parsed_conf), static_cast<nlohmann::json>(conf));
+}
+
+TEST(redis_plugin, factory_conf_rejects_negative_timeouts) {
+  for (const char* field : {"connect_timeout_ms", "socket_timeout_ms", "pool_wait_timeout_ms"}) {
+    SCOPED_TRACE(field);
+    RedisClusterTableFactoryConfig conf;
+    conf.check();  // the defaults (0 = wait forever) are valid
+    nlohmann::json json = static_cast<nlohmann::json>(conf);
+    json[field] = -1;
+    EXPECT_ANY_THROW({
+      const RedisClusterTableFactoryConfig parsed(json);
+      ASSERT_EQ(static_cast<nlohmann::json>(parsed).at(field), -1);  // the value was read
+      parsed.check();
+    });
+  }
+}
+
+// A server that accepts connections but never replies: with `socket_timeout_ms` set, the first
+// command must fail within about that time instead of blocking forever. The listener never calls
+// accept(); the kernel completes the TCP handshake from the backlog, so the client connects and
+// then waits for a reply that never comes. Needs no Redis server.
+TEST(redis_plugin, single_node_socket_timeout) {
+  const int listener{::socket(AF_INET, SOCK_STREAM, 0)};
+  ASSERT_GE(listener, 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0;  // any free port
+  ASSERT_EQ(::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+  ASSERT_EQ(::listen(listener, 16), 0);
+  socklen_t addr_len{sizeof(addr)};
+  ASSERT_EQ(::getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &addr_len), 0);
+
+  RedisClusterTableFactoryConfig fac_conf;
+  fac_conf.address = "127.0.0.1:" + std::to_string(ntohs(addr.sin_port));
+  fac_conf.single_node = true;
+  fac_conf.connect_timeout_ms = 200;
+  fac_conf.socket_timeout_ms = 200;
+  fac_conf.pool_wait_timeout_ms = 200;
+
+  // Without the timeouts the command below would block forever, so run it on a thread and bound
+  // the wait: a hang reports a failure and exits instead of stalling the test run.
+  auto run = std::async(std::launch::async, [&fac_conf]() {
+    const auto start = std::chrono::steady_clock::now();
+    bool threw{false};
+    try {
+      RedisClusterTableFactory fac{fac_conf};
+      nlohmann::json table_conf{{"key_size", sizeof(int64_t)},
+                                {"max_value_size", 16},
+                                {"value_dtype", "float32"},
+                                {"num_partitions", 0},
+                                {"string_namespace_id", 4242}};
+      host_table_ptr_t tab{std::dynamic_pointer_cast<HostTableLike>(fac.produce(3, table_conf))};
+      auto ctx = tab->create_execution_context(0, 0, nullptr, nullptr);
+      tab->clear(ctx);  // the first command; redis-plus-plus connects lazily
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    return std::make_pair(threw, std::chrono::steady_clock::now() - start);
+  });
+  if (run.wait_for(std::chrono::seconds(20)) != std::future_status::ready) {
+    std::fprintf(stderr, "HANG: a command against a silent server did not time out in 20 s\n");
+    std::_Exit(1);
+  }
+  const auto [threw, elapsed] = run.get();
+  EXPECT_TRUE(threw) << "a command against a server that never replies must fail";
+  EXPECT_LT(elapsed, std::chrono::seconds(5)) << "the socket timeout was not applied";
+  ::close(listener);
 }
 
 // End-to-end CRUD against a live standalone Redis in string mode (`num_partitions == 0`). Uses a

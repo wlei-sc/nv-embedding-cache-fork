@@ -1319,6 +1319,9 @@ void RedisClusterTableFactoryConfig::check() const {
   NVE_CHECK_(!user_name.empty());
 
   NVE_CHECK_(connections_per_node > 0);
+  NVE_CHECK_(connect_timeout_ms >= 0);
+  NVE_CHECK_(socket_timeout_ms >= 0);
+  NVE_CHECK_(pool_wait_timeout_ms >= 0);
 
   if (use_tls) {
     NVE_CHECK_(!ca_certificate.empty());
@@ -1345,6 +1348,10 @@ void from_json(const nlohmann::json& json, RedisClusterTableFactoryConfig& conf)
   NVE_READ_JSON_FIELD_(client_certificate);
   NVE_READ_JSON_FIELD_(client_key);
   NVE_READ_JSON_FIELD_(server_name_identification);
+
+  NVE_READ_JSON_FIELD_(connect_timeout_ms);
+  NVE_READ_JSON_FIELD_(socket_timeout_ms);
+  NVE_READ_JSON_FIELD_(pool_wait_timeout_ms);
 }
 
 void to_json(nlohmann::json& json, const RedisClusterTableFactoryConfig& conf) {
@@ -1364,6 +1371,10 @@ void to_json(nlohmann::json& json, const RedisClusterTableFactoryConfig& conf) {
   NVE_WRITE_JSON_FIELD_(client_certificate);
   NVE_WRITE_JSON_FIELD_(client_key);
   NVE_WRITE_JSON_FIELD_(server_name_identification);
+
+  NVE_WRITE_JSON_FIELD_(connect_timeout_ms);
+  NVE_WRITE_JSON_FIELD_(socket_timeout_ms);
+  NVE_WRITE_JSON_FIELD_(pool_wait_timeout_ms);
 }
 
 RedisClusterTableFactory::RedisClusterTableFactory(const config_type& config)
@@ -1387,7 +1398,10 @@ RedisClusterTableFactory::RedisClusterTableFactory(const config_type& config)
   conn_opts.password = config.password;
 
   conn_opts.keep_alive = config.keep_alive;
+  conn_opts.connect_timeout = std::chrono::milliseconds(config.connect_timeout_ms);
+  conn_opts.socket_timeout = std::chrono::milliseconds(config.socket_timeout_ms);
   pool_opts.size = to_uint(config.connections_per_node);
+  pool_opts.wait_timeout = std::chrono::milliseconds(config.pool_wait_timeout_ms);
 
   // TLS/SSL related seutp.
   conn_opts.tls.enabled = config.use_tls;
