@@ -457,6 +457,7 @@ public:
         }
         typename layer_type::Config layer_cfg = {"ps_layer", std::make_shared<DefaultInsertHeuristic>(insert_heuristic_thresholds)};
         layer_cfg.default_embedding = config.default_embedding;
+        layer_cfg.cache_missed_keys = config.cache_missed_keys;
         this->emb_layer_ptr_ = std::make_shared<layer_type>(layer_cfg, tables, nullptr /* using default allocator for device 0*/);
     }
 

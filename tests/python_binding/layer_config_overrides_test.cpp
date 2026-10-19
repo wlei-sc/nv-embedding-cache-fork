@@ -163,7 +163,8 @@ TEST(LayerConfigOverridesTest, KnobsAreValidatedAgainstLayerType) {
         {"max_modify_size", {"LinearUVM", "Hierarchical"}},
         {"default_row_index", {"LinearUVM", "GPULayer"}},
         {"default_embedding", {"Hierarchical", "HostLayer"}},
-        {"disable_threadpool", {"HostLayer"}}
+        {"disable_threadpool", {"HostLayer"}},
+        {"cache_missed_keys", {"Hierarchical"}}
     };
     json patches = EmbedLayerConfig{};
     patches["gpu_cache_size"] = 0;

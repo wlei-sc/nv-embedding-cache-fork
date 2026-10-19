@@ -1299,6 +1299,103 @@ TEST(HierachicalDefaultEmbedding, NoDefaultLeavesMissesUntouched) {
   }
 }
 
+// Two host tables, a cache in front of a backing table, with a default embedding and auto-insert
+// into both. Keys [0, 16) live in the backing table, [16, 32) nowhere. After one lookup and its
+// auto-insert, caching missed keys (Config::cache_missed_keys, or set_cache_missed_keys when
+// `via_config` is false) decides whether the missing keys were cached under their own key (so a
+// second lookup resolves every key from the cache) or dropped. Either way the backing table never
+// receives them: it holds its 16 keys plus the invalid key that misses are rewritten to.
+static void RunCacheMissedKeys(const bool cache_missed_keys, const bool via_config = false) {
+  cudaGetLastError();
+  using IndexT = int64_t;
+  constexpr uint64_t row_size = 64;
+  constexpr uint64_t num_keys = 32;
+  constexpr uint64_t num_stored = 16;
+  constexpr uint8_t default_byte = 0xAB;
+  constexpr uint8_t stored_byte = 0x42;
+
+  HostTableConfig host_cfg;
+  host_cfg.value_dtype = DataType_t::Float32;
+  host_cfg.max_value_size = static_cast<int64_t>(row_size);
+  auto cache_tab = std::make_shared<MockHostTable<IndexT>>(host_cfg, true /*functional_ref*/);
+  auto backing_tab = std::make_shared<MockHostTable<IndexT>>(host_cfg, true /*functional_ref*/);
+
+  typename HierarchicalEmbeddingLayer<IndexT>::Config layer_cfg;
+  layer_cfg.insert_heuristic = std::make_shared<TestInsertHeuristic>(std::vector<bool>{true, true});
+  layer_cfg.default_embedding = std::vector<uint8_t>(row_size, default_byte);
+  layer_cfg.cache_missed_keys = via_config && cache_missed_keys;
+  std::vector<table_ptr_t> tables{cache_tab, backing_tab};
+  auto layer = std::make_shared<HierarchicalEmbeddingLayer<IndexT>>(layer_cfg, tables);
+  if (!via_config) {
+    layer->set_cache_missed_keys(cache_missed_keys);
+  }
+  auto ctx = layer->create_execution_context(0, 0, nullptr, nullptr);
+
+  std::vector<IndexT> keys(num_keys);
+  for (uint64_t i = 0; i < num_keys; i++) keys[i] = static_cast<IndexT>(i);
+  std::vector<uint8_t> stored(num_stored * row_size, stored_byte);
+  layer->insert(ctx, static_cast<int64_t>(num_stored), keys.data(), static_cast<int64_t>(row_size),
+                static_cast<int64_t>(row_size), stored.data(), 1 /*table_id: backing*/);
+  ctx->wait();
+
+  std::vector<uint8_t> output(num_keys * row_size);
+  std::vector<bitmask64_t> hitmask(ceil_div(num_keys, to_uint(bitmask64::num_bits)));
+  float hitrates[2] = {};
+  const auto lookup = [&] {
+    std::fill(output.begin(), output.end(), uint8_t{0});
+    std::fill(hitmask.begin(), hitmask.end(), bitmask64_t{0});
+    layer->lookup(ctx, static_cast<int64_t>(num_keys), keys.data(), output.data(),
+                  static_cast<int64_t>(row_size), hitmask.data(), nullptr /*pool_params*/, hitrates);
+    ctx->wait();  // also waits for the auto-insert
+  };
+  lookup();
+
+  context_ptr_t no_ctx;
+  const int64_t cached = cache_tab->size(no_ctx, false) / static_cast<int64_t>(row_size);
+  const int64_t backing = backing_tab->size(no_ctx, false) / static_cast<int64_t>(row_size);
+  EXPECT_EQ(cached, cache_missed_keys ? int64_t{num_keys} : int64_t{num_stored + 1});
+  EXPECT_EQ(backing, int64_t{num_stored + 1});
+
+  lookup();
+  EXPECT_FLOAT_EQ(hitrates[0], cache_missed_keys ? 1.0f : 0.5f);
+  EXPECT_FLOAT_EQ(hitrates[1], 0.0f);
+  for (uint64_t i = 0; i < num_keys; i++) {
+    const auto mask{hitmask[i / to_uint(bitmask64::num_bits)]};
+    const bool hit{bitmask64::get(mask, static_cast<int64_t>(i) % bitmask64::num_bits)};
+    ASSERT_EQ(hit, i < num_stored || cache_missed_keys) << "key " << i;
+    const uint8_t expected = (i < num_stored) ? stored_byte : default_byte;
+    for (uint64_t j = 0; j < row_size; j++) {
+      ASSERT_EQ(expected, output[i * row_size + j]) << "key " << i << " byte " << j;
+    }
+  }
+}
+
+TEST(HierachicalDefaultEmbedding, CacheMissedKeys) { RunCacheMissedKeys(true); }
+TEST(HierachicalDefaultEmbedding, MissedKeysNotCachedByDefault) { RunCacheMissedKeys(false); }
+TEST(HierachicalDefaultEmbedding, CacheMissedKeysFromConfig) {
+  RunCacheMissedKeys(true, true /*via_config*/);
+}
+TEST(HierachicalDefaultEmbedding, MissedKeysNotCachedByDefaultConfig) {
+  RunCacheMissedKeys(false, true /*via_config*/);
+}
+
+TEST(HierachicalDefaultEmbedding, CacheMissedKeysNeedsDefault) {
+  cudaGetLastError();
+  using IndexT = int64_t;
+  HostTableConfig host_cfg;
+  host_cfg.value_dtype = DataType_t::Float32;
+  host_cfg.max_value_size = 32;
+  std::vector<table_ptr_t> tables{std::make_shared<MockHostTable<IndexT>>(host_cfg, true),
+                                  std::make_shared<MockHostTable<IndexT>>(host_cfg, true)};
+  typename HierarchicalEmbeddingLayer<IndexT>::Config layer_cfg;  // no default_embedding
+  auto layer = std::make_shared<HierarchicalEmbeddingLayer<IndexT>>(layer_cfg, tables);
+  EXPECT_ANY_THROW(layer->set_cache_missed_keys(true));
+  EXPECT_NO_THROW(layer->set_cache_missed_keys(false));
+  // The config flag is checked at construction.
+  layer_cfg.cache_missed_keys = true;
+  EXPECT_ANY_THROW(std::make_shared<HierarchicalEmbeddingLayer<IndexT>>(layer_cfg, tables));
+}
+
 // Exercises HierarchicalEmbeddingLayer wrapping a single LinearHostTable — the
 // configuration that backs the Python HostLayer binding.
 TEST(HierachicalLinearHost, LookupReadsHostBuffer) {

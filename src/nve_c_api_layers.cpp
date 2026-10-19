@@ -63,6 +63,7 @@ std::shared_ptr<nve::EmbeddingLayerBase> make_hierarchical_layer(
   cfg.min_insert_size_gpu = c.min_insert_size_gpu;
   cfg.min_insert_size_host = c.min_insert_size_host;
   cfg.default_embedding = copy_default_embedding(c.default_embedding, c.default_embedding_size);
+  cfg.cache_missed_keys = c.cache_missed_keys != 0;
   return std::make_shared<nve::HierarchicalEmbeddingLayer<KeyType>>(cfg, tables, alloc);
 }
 
