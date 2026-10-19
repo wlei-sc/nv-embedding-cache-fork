@@ -146,6 +146,12 @@ struct RedisClusterTableFactoryConfig final : public HostTableFactoryConfig {
   std::string server_name_identification{
       "redis.localhost"};  // SNI to request (can deviate from connection address).
 
+  // Command for string mode's multi-key reads. MGET by default; any other name must be an
+  // MGET-compatible command (same key list in, same array-of-values reply out), such as one a
+  // Redis proxy or module serves, and requires `single_node`. Last, so positional initializers of
+  // the fields above keep working.
+  std::string mget_command{"MGET"};
+
   void check() const;
 };
 

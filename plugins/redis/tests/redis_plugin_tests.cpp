@@ -17,6 +17,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <buffer_wrapper.hpp>
 #include <execution_context.hpp>
 #include <host_table.hpp>
@@ -71,7 +72,8 @@ TEST(redis_plugin, parse_table_conf) {
 TEST(redis_plugin, parse_factory_conf) {
   const RedisClusterTableFactoryConfig conf{
       {},    "localhost:7000", "admin",       "12345",      true /*single_node*/, false,   3,
-      true,  "my_bundle.crt",  "my_cert.pem", "my_key.pem", "my_sni"};
+      true,  "my_bundle.crt",  "my_cert.pem", "my_key.pem", "my_sni",
+      "KP.MGET" /*mget_command*/};
   std::cout << static_cast<nlohmann::json>(conf) << '\n';
 
   nlohmann::json json(R"({
@@ -87,12 +89,112 @@ TEST(redis_plugin, parse_factory_conf) {
     "ca_certificate": "my_bundle.crt",
     "client_certificate": "my_cert.pem",
     "client_key": "my_key.pem",
-    "server_name_identification": "my_sni"
+    "server_name_identification": "my_sni",
+
+    "mget_command": "KP.MGET"
   })"_json);
   ASSERT_TRUE(is_json_subset(json, static_cast<nlohmann::json>(conf)));
 
   RedisClusterTableFactoryConfig parsed_conf(json);
   ASSERT_EQ(static_cast<nlohmann::json>(parsed_conf), static_cast<nlohmann::json>(conf));
+}
+
+TEST(redis_plugin, factory_conf_checks_mget_command) {
+  RedisClusterTableFactoryConfig conf;
+  conf.check();  // MGET is valid in cluster mode
+  conf.mget_command = "";
+  EXPECT_ANY_THROW(conf.check());
+  conf.mget_command = "KP.MGET";
+  EXPECT_ANY_THROW(conf.check()) << "a command other than MGET needs single_node";
+  conf.single_node = true;
+  conf.check();
+}
+
+// String-mode reads through the raw-command path a custom `mget_command` takes. A plain Redis has
+// no proxy command, but command names are case-insensitive, so "mget" takes the raw path and the
+// server runs it as MGET. A small `max_batch_size` sends several batches per find, covering both of
+// find's read call sites. Fails when no Redis server is reachable.
+TEST(redis_plugin, single_node_string_custom_mget_command) {
+  using key_type = int64_t;
+
+  const int64_t max_value_size{16};
+  const int64_t value_stride{max_value_size};
+  const nlohmann::json table_conf{{"key_size", sizeof(key_type)},
+                                  {"max_value_size", max_value_size},
+                                  {"value_dtype", "float32"},
+                                  {"num_partitions", 0},
+                                  {"max_batch_size", 256},
+                                  {"string_namespace_id", 13579}};
+
+  RedisClusterTableFactoryConfig fac_conf;
+  fac_conf.address = "localhost:6379";
+  fac_conf.single_node = true;
+  fac_conf.mget_command = "mget";
+  RedisClusterTableFactory fac{fac_conf};
+  host_table_ptr_t tab{std::dynamic_pointer_cast<HostTableLike>(fac.produce(9, table_conf))};
+  auto ctx = tab->create_execution_context(0, 0, nullptr, nullptr);
+
+  try {
+    tab->clear(ctx);
+  } catch (const std::exception& e) {
+    GTEST_FAIL() << "No standalone Redis reachable at localhost:6379: " << e.what();
+  }
+
+  // Keys 1..n exist (inserts use MSET; only reads take `mget_command`), n+1..2n don't.
+  const int64_t n{1000};
+  const int64_t m{2 * n};
+  std::vector<key_type> keys(to_uint(m));
+  std::iota(keys.begin(), keys.end(), key_type{1});
+  std::vector<char> values(to_uint(n * value_stride));
+  for (int64_t i{}; i != n; ++i) {
+    for (int64_t j{}; j != max_value_size; ++j) {
+      values[to_uint(i * value_stride + j)] = static_cast<char>((i * 13 + j) & 0xff);
+    }
+  }
+  auto keys_bw = [&](context_ptr_t& c, int64_t count) {
+    return std::make_shared<BufferWrapper<const void>>(c, "keys", keys.data(),
+                                                       to_uint(count) * sizeof(key_type));
+  };
+  tab->insert(ctx, n, keys_bw(ctx, n), value_stride, max_value_size,
+              std::make_shared<BufferWrapper<const void>>(ctx, "values_in", values.data(),
+                                                          values.size()));
+
+  std::vector<bitmask64_t> hit_mask(to_uint(ceil_div(m, bitmask64::num_bits)), 0);
+  std::vector<char> out_values(to_uint(m * value_stride), 0);
+  int64_t cnt{};
+  tab->reset_lookup_counter(ctx);
+  tab->find(ctx, m, keys_bw(ctx, m),
+            std::make_shared<BufferWrapper<bitmask64_t>>(ctx, "hit_mask", hit_mask.data(),
+                                                         hit_mask.size() * sizeof(bitmask64_t)),
+            value_stride,
+            std::make_shared<BufferWrapper<void>>(ctx, "values_out", out_values.data(),
+                                                  out_values.size()),
+            nullptr);
+  tab->get_lookup_counter(ctx, &cnt);
+  ASSERT_EQ(cnt, n);
+  for (int64_t i{}; i != m; ++i) {
+    const bool hit{
+        bitmask64::get(hit_mask[to_uint(i / bitmask64::num_bits)], i % bitmask64::num_bits)};
+    ASSERT_EQ(hit, i < n) << "key " << keys[to_uint(i)];
+  }
+  ASSERT_TRUE(std::equal(values.begin(), values.end(), out_values.begin())) << "payload mismatch";
+
+  // An unknown command reaches the server, which rejects it: the read fails instead of falling back
+  // to MGET.
+  fac_conf.mget_command = "NVE.NO_SUCH_MGET";
+  RedisClusterTableFactory bad_fac{fac_conf};
+  host_table_ptr_t bad_tab{
+      std::dynamic_pointer_cast<HostTableLike>(bad_fac.produce(10, table_conf))};
+  auto bad_ctx = bad_tab->create_execution_context(0, 0, nullptr, nullptr);
+  std::fill(hit_mask.begin(), hit_mask.end(), 0);
+  EXPECT_ANY_THROW(bad_tab->find(
+      bad_ctx, n, keys_bw(bad_ctx, n),
+      std::make_shared<BufferWrapper<bitmask64_t>>(bad_ctx, "hit_mask", hit_mask.data(),
+                                                   hit_mask.size() * sizeof(bitmask64_t)),
+      value_stride, nullptr, nullptr));
+
+  tab->clear(ctx);
+  ASSERT_EQ(tab->size(ctx, true), 0);
 }
 
 // End-to-end CRUD against a live standalone Redis in string mode (`num_partitions == 0`). Uses a

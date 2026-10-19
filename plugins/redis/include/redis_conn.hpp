@@ -27,6 +27,7 @@
 
 #include <common.hpp>
 #include <memory>
+#include <string>
 #include <utility>
 
 namespace nve {
@@ -47,8 +48,12 @@ class RedisConn final {
 
   explicit RedisConn(std::shared_ptr<sw::redis::RedisCluster> cluster)
       : cluster_{std::move(cluster)} {}
-  explicit RedisConn(std::shared_ptr<sw::redis::Redis> standalone)
-      : standalone_{std::move(standalone)} {}
+  // `mget_command` is the command `string_mget` sends (see RedisClusterTableFactoryConfig).
+  explicit RedisConn(std::shared_ptr<sw::redis::Redis> standalone,
+                     std::string mget_command = "MGET")
+      : standalone_{std::move(standalone)},
+        mget_command_{std::move(mget_command)},
+        custom_mget_{mget_command_ != "MGET"} {}
 
   // True when backed by a standalone (single-node) connection.
   bool is_single_node() const noexcept { return static_cast<bool>(standalone_); }
@@ -75,6 +80,29 @@ class RedisConn final {
   NVE_REDIS_FWD_(hgetall, const)
   NVE_REDIS_FWD_(hincrby)
 #undef NVE_REDIS_FWD_
+
+  // String mode's multi-key read. With the default command, MGET, this is redis-plus-plus's
+  // `mget`. Any other name is an MGET-compatible command (same key list in, same array-of-values
+  // reply out), e.g. one a Redis proxy serves in place of MGET: it goes out as a raw command on the
+  // standalone connection, and its array reply is parsed through the same output iterator.
+  template <typename Input, typename Output>
+  void string_mget(Input first, Input last, Output output) const {
+    if (!custom_mget_) {
+      mget(first, last, output);
+      return;
+    }
+    NVE_CHECK_(is_single_node(), "`", mget_command_,
+               "` is only supported in single-node (string) mode.");
+    auto reply = standalone_->command(
+        [this](sw::redis::Connection& connection, Input f, Input l) {
+          sw::redis::CmdArgs args;
+          args << mget_command_ << std::make_pair(f, l);
+          connection.send(args);
+        },
+        first, last);
+    NVE_CHECK_(reply != nullptr, "`", mget_command_, "` returned a null reply from Redis.");
+    sw::redis::reply::to_array(*reply, output);
+  }
 
   // Cluster pipelines require a hash-tag for slot routing; standalone pipelines ignore it.
   sw::redis::Pipeline pipeline(const sw::redis::StringView& hash_tag) {
@@ -105,6 +133,8 @@ class RedisConn final {
  private:
   std::shared_ptr<sw::redis::RedisCluster> cluster_;
   std::shared_ptr<sw::redis::Redis> standalone_;
+  std::string mget_command_{"MGET"};
+  bool custom_mget_{false};  // `mget_command_` isn't MGET: send it as a raw command
 };
 
 }  // namespace plugin
