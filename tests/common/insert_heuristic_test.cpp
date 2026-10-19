@@ -76,6 +76,27 @@ TEST(DefaultInsertHeuristic, DefaultInsert) {
   }
 }
 
+// A threshold <= 0 disables auto-insert for its table at every hit rate, as for FSMInsertHeuristic
+// (the Hierarchical binding passes 0 for a remote tier that is updated externally). Tables with a
+// positive threshold keep inserting.
+TEST(DefaultInsertHeuristic, NonPositiveThresholdDisablesInsert) {
+  nve::DefaultInsertHeuristic heuristic(std::vector<float>{0.8f, 0.f, -1.f});
+  const std::vector<float> hitrates{0.f, 0.25f, 0.5f, 0.79f, 0.8f, 0.99f, 1.f};
+  constexpr int kRounds = 1000;
+  int64_t inserts[3] = {0, 0, 0};
+  for (int round = 0; round < kRounds; ++round) {
+    for (const float hitrate : hitrates) {
+      for (size_t table_id = 0; table_id < 3; ++table_id) {
+        inserts[table_id] += heuristic.insert_needed(hitrate, table_id) ? 1 : 0;
+      }
+    }
+  }
+  EXPECT_EQ(inserts[1], 0) << "threshold 0 inserted";
+  EXPECT_EQ(inserts[2], 0) << "threshold -1 inserted";
+  // At hit rate 0 the chance is 1, so the 0.8 table inserts at least once per round.
+  EXPECT_GE(inserts[0], kRounds);
+}
+
 TEST(FSMInsertHeuristic, FSMInsertOnlyWarmup) {
   uint32_t num_warmup = 35;
   uint32_t num_steady = 0;
