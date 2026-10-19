@@ -286,6 +286,7 @@ Factory config options (`nve_create_table_factory`):
 | `keep_alive` | `true` | Keep TCP connections alive. |
 | `connections_per_node` | `5` | Max parallel connections per Redis node. In standalone string mode set this `≥ num_partitions` so the parallel work isn't bottlenecked on the pool. |
 | `use_tls` | `false` | Encrypt connections with TLS (with `ca_certificate`, `client_certificate`, `client_key`, `server_name_identification`). |
+| `mget_command` | `MGET` | Command for string-mode multi-key reads. Any other value must be an MGET-compatible command (same key list in, same array-of-values reply out), e.g. one a Redis proxy or module serves in place of `MGET`, and requires `single_node`. |
 
 Table config options (`nve_table_factory_produce`), in addition to the common fields above:
 

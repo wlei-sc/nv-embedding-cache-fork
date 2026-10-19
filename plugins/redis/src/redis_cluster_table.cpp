@@ -1105,7 +1105,7 @@ int64_t RedisClusterTable<KeyType, MetaType, PartitionerType>::find_(
         // Run query if the batch is about to overflow.
         if NVE_UNLIKELY_(static_cast<int64_t>(k_views.size()) + bitmask64::count(it) >
                          max_batch_size) {
-          cluster->kp_mget(k_views.begin(), k_views.end(), parser_t(callback));
+          cluster->string_mget(k_views.begin(), k_views.end(), parser_t(callback));
           k_views.clear();
           view_to_ij.clear();
         }
@@ -1122,7 +1122,7 @@ int64_t RedisClusterTable<KeyType, MetaType, PartitionerType>::find_(
         }
       }
       if (!k_views.empty()) {
-        cluster->kp_mget(k_views.begin(), k_views.end(), parser_t(callback));
+        cluster->string_mget(k_views.begin(), k_views.end(), parser_t(callback));
       }
 
       total_num_hits.fetch_add(num_hits, std::memory_order_relaxed);
@@ -1326,6 +1326,11 @@ void RedisClusterTableFactoryConfig::check() const {
     NVE_CHECK_(!client_key.empty());
     NVE_CHECK_(!server_name_identification.empty());
   }
+
+  NVE_CHECK_(!mget_command.empty(), "`mget_command` must not be empty.");
+  // A custom command has no cluster slot routing.
+  NVE_CHECK_(single_node || mget_command == "MGET",
+             "`mget_command` other than MGET requires `single_node`.");
 }
 
 void from_json(const nlohmann::json& json, RedisClusterTableFactoryConfig& conf) {
@@ -1345,6 +1350,8 @@ void from_json(const nlohmann::json& json, RedisClusterTableFactoryConfig& conf)
   NVE_READ_JSON_FIELD_(client_certificate);
   NVE_READ_JSON_FIELD_(client_key);
   NVE_READ_JSON_FIELD_(server_name_identification);
+
+  NVE_READ_JSON_FIELD_(mget_command);
 }
 
 void to_json(nlohmann::json& json, const RedisClusterTableFactoryConfig& conf) {
@@ -1364,6 +1371,8 @@ void to_json(nlohmann::json& json, const RedisClusterTableFactoryConfig& conf) {
   NVE_WRITE_JSON_FIELD_(client_certificate);
   NVE_WRITE_JSON_FIELD_(client_key);
   NVE_WRITE_JSON_FIELD_(server_name_identification);
+
+  NVE_WRITE_JSON_FIELD_(mget_command);
 }
 
 RedisClusterTableFactory::RedisClusterTableFactory(const config_type& config)
@@ -1410,7 +1419,7 @@ RedisClusterTableFactory::RedisClusterTableFactory(const config_type& config)
                              NVE_LOG_INFO_("Disconnection from Redis standalone '", addr,
                                            "' concluded.");
                            }};
-    conn_ = std::make_shared<RedisConn>(std::move(standalone));
+    conn_ = std::make_shared<RedisConn>(std::move(standalone), config.mget_command);
   } else {
     redis_cluster_ptr_t cluster{new sw::redis::RedisCluster(conn_opts, pool_opts),
                                 [addr](sw::redis::RedisCluster* const p) {
