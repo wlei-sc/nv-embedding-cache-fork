@@ -232,6 +232,10 @@ typedef struct {
    * default_embedding_size, when non-zero, must equal the tables' row size. */
   const void*     default_embedding;
   int64_t         default_embedding_size;
+  /* bool: cache keys missing from all tables, with the default embedding, in the cache tables
+   * (every table but the last), so later lookups don't reach the last table for them.
+   * Requires a default embedding. 0 (the default) disables it. */
+  int             cache_missed_keys;
 } nve_hierarchical_layer_config_t;
 
 typedef struct {

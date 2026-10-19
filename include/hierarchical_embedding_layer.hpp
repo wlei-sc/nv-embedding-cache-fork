@@ -41,6 +41,7 @@ class HierarchicalEmbeddingLayer : public EmbeddingLayerBase {
     int64_t min_insert_size_gpu = 1 << 16; // Minimal amount of keys to trigger an insert on GPU (smaller amounts will be collected)
     int64_t min_insert_size_host = 0; // Minimal amount of keys to trigger an insert on Host (smaller amounts will be collected)
     std::vector<uint8_t> default_embedding = {}; // Default embedding vector bytes returned for keys missing from all tables. Empty implies no default (misses undefined).
+    bool cache_missed_keys = false; // Cache keys missing from all tables, with the default embedding, in the cache tables (see set_cache_missed_keys). Requires default_embedding.
   };
 
   NVE_PREVENT_COPY_AND_MOVE_(HierarchicalEmbeddingLayer);
@@ -85,8 +86,8 @@ class HierarchicalEmbeddingLayer : public EmbeddingLayerBase {
    * Auto-insert then stores such a key under its own key, with the default embedding as its row,
    * instead of dropping it, so later lookups resolve it from the caches like any other key rather
    * than asking the last table again. The last table, the backing store the misses came from,
-   * never receives them. Off by default. Requires a `default_embedding`. Call before the first
-   * lookup.
+   * never receives them. Off by default; `Config::cache_missed_keys` turns it on at construction.
+   * Requires a `default_embedding`. Call before the first lookup.
    */
   void set_cache_missed_keys(bool enable);
 

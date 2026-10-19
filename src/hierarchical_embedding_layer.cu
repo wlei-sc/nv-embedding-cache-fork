@@ -115,6 +115,9 @@ HierarchicalEmbeddingLayer<KeyType>::HierarchicalEmbeddingLayer(
       &invalid_key
     ));
   }
+  if (config_.cache_missed_keys) {
+    set_cache_missed_keys(true);
+  }
 }
 
 template <typename KeyType>

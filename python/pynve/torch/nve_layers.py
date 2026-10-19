@@ -107,6 +107,8 @@ def config_to_nve_config(config: dict):
         embed_config.default_embedding = list(value)
     if "disable_threadpool" in config:
         embed_config.disable_threadpool = bool(config["disable_threadpool"])
+    if "cache_missed_keys" in config:
+        embed_config.cache_missed_keys = bool(config["cache_missed_keys"])
     return embed_config
 
 class LayerType(Enum):
@@ -202,6 +204,10 @@ class NVEmbeddingBase(torch.nn.Module):
         if self.config.disable_threadpool and layer_type != LayerType.HostLayer:
             raise ValueError(
                 f"config['disable_threadpool'] is only supported for HostLayer, "
+                f"got layer_type={layer_type}")
+        if self.config.cache_missed_keys and layer_type != LayerType.Hierarchical:
+            raise ValueError(
+                f"config['cache_missed_keys'] is only supported for Hierarchical, "
                 f"got layer_type={layer_type}")
         self.gpu_cache_size = gpu_cache_size
         self.host_cache_size = host_cache_size

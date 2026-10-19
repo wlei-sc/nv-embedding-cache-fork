@@ -292,6 +292,7 @@ TEST(NveCApiSizedDefaults, LibraryDefaults) {
   EXPECT_EQ(hier_defaults.min_insert_size_host, hier.min_insert_size_host);
   EXPECT_EQ(hier_defaults.default_embedding.empty(), hier.default_embedding == nullptr);
   EXPECT_EQ(static_cast<int64_t>(hier_defaults.default_embedding.size()), hier.default_embedding_size);
+  EXPECT_EQ(hier_defaults.cache_missed_keys, hier.cache_missed_keys != 0);
   if (!hier_defaults.default_embedding.empty()) {
     ASSERT_NE(nullptr, hier.default_embedding);
     EXPECT_EQ(0, std::memcmp(hier_defaults.default_embedding.data(), hier.default_embedding,
@@ -464,6 +465,24 @@ TEST_P(NveCApiSizedLayer, HierarchicalLookupAndDefaultEmbedding) {
   cfg.default_embedding = &default_embedding;
   cfg.default_embedding_size = sizeof(default_embedding);
   ASSERT_EQ(NVE_SUCCESS, nve_heuristic_create_never(&cfg.insert_heuristic));
+  const auto status = nve_hierarchical_layer_create(&layer_, GetParam(), &cfg, &table_, 1, nullptr);
+  EXPECT_EQ(NVE_SUCCESS, nve_heuristic_destroy(cfg.insert_heuristic));
+  ASSERT_EQ(NVE_SUCCESS, status);
+  CheckLookup();
+}
+
+TEST_P(NveCApiSizedLayer, HierarchicalCacheMissedKeysNeedsDefaultEmbedding) {
+  nve_hierarchical_layer_config_t cfg;
+  ASSERT_EQ(NVE_SUCCESS, nve_hierarchical_layer_config_init(&cfg, sizeof(cfg)));
+  EXPECT_EQ(0, cfg.cache_missed_keys);
+  cfg.layer_name = "sized_hierarchical_cache_missed_keys";
+  cfg.cache_missed_keys = 1;  // without a default embedding: rejected at creation
+  ASSERT_EQ(NVE_SUCCESS, nve_heuristic_create_never(&cfg.insert_heuristic));
+  EXPECT_NE(NVE_SUCCESS,
+            nve_hierarchical_layer_create(&layer_, GetParam(), &cfg, &table_, 1, nullptr));
+  const float default_embedding = 7.5f;
+  cfg.default_embedding = &default_embedding;
+  cfg.default_embedding_size = sizeof(default_embedding);
   const auto status = nve_hierarchical_layer_create(&layer_, GetParam(), &cfg, &table_, 1, nullptr);
   EXPECT_EQ(NVE_SUCCESS, nve_heuristic_destroy(cfg.insert_heuristic));
   ASSERT_EQ(NVE_SUCCESS, status);

@@ -39,12 +39,13 @@ struct EmbedLayerConfig {
     int64_t default_row_index = -1; // Row returned for keys outside the table, negative disables the check
     std::vector<uint8_t> default_embedding = {}; // Raw row bytes for missing keys (Host/Hierarchical).
     bool disable_threadpool = false; // HostLayer only: run lookups on the caller thread.
+    bool cache_missed_keys = false; // Hierarchical only: cache keys missing from every table (needs default_embedding).
 };
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(
     EmbedLayerConfig,
     logging_interval, kernel_mode, kernel_mode_value_1, kernel_mode_value_2, max_modify_size,
-    default_row_index, default_embedding, disable_threadpool)
+    default_row_index, default_embedding, disable_threadpool, cache_missed_keys)
 
 // Partial patches in metadata format. Precedence: export < defaults < per_layer.
 struct LayerConfigOverrides {
@@ -66,7 +67,8 @@ inline nlohmann::json layer_config_schema(const std::string& layer_type,
     } else if (layer_type == "Hierarchical") {
         result["gpu_cache_size"] = schema.at("gpu_cache_size");
         result["host_cache_size"] = schema.at("host_cache_size");
-        config_fields.insert(config_fields.end(), {"max_modify_size", "default_embedding"});
+        config_fields.insert(config_fields.end(),
+                             {"max_modify_size", "default_embedding", "cache_missed_keys"});
     } else if (layer_type == "GPULayer") {
         config_fields.push_back("default_row_index");
     } else if (layer_type == "HostLayer") {

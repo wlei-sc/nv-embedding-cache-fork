@@ -218,7 +218,7 @@ template <>
 struct nve_config_traits<nve_hierarchical_layer_config_t> {
   using Config = nve_hierarchical_layer_config_t;
   static constexpr uint32_t tag = NVE_CONFIG_TAG_HIERARCHICAL_LAYER_;
-  NVE_CHECK_CXX_CONFIG_MEMBERS_(nve::HierarchicalEmbeddingLayer<int64_t>::Config, 7);
+  NVE_CHECK_CXX_CONFIG_MEMBERS_(nve::HierarchicalEmbeddingLayer<int64_t>::Config, 8);
   static Config defaults() {
     static const nve::HierarchicalEmbeddingLayer<int64_t>::Config defaults{};
     Config c{};
@@ -231,6 +231,7 @@ struct nve_config_traits<nve_hierarchical_layer_config_t> {
     c.default_embedding =
         defaults.default_embedding.empty() ? nullptr : defaults.default_embedding.data();
     c.default_embedding_size = static_cast<int64_t>(defaults.default_embedding.size());
+    c.cache_missed_keys = defaults.cache_missed_keys;
     return c;
   }
   inline static constexpr nve_config_field fields[] = {
@@ -242,6 +243,7 @@ struct nve_config_traits<nve_hierarchical_layer_config_t> {
     NVE_CONFIG_FIELD_(min_insert_size_host),
     NVE_CONFIG_FIELD_(default_embedding),
     NVE_CONFIG_FIELD_(default_embedding_size),
+    NVE_CONFIG_FIELD_(cache_missed_keys),
   };
 };
 

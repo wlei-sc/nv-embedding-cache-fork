@@ -1301,10 +1301,11 @@ TEST(HierachicalDefaultEmbedding, NoDefaultLeavesMissesUntouched) {
 
 // Two host tables, a cache in front of a backing table, with a default embedding and auto-insert
 // into both. Keys [0, 16) live in the backing table, [16, 32) nowhere. After one lookup and its
-// auto-insert, set_cache_missed_keys decides whether the missing keys were cached under their own
-// key (so a second lookup resolves every key from the cache) or dropped. Either way the backing
-// table never receives them: it holds its 16 keys plus the invalid key that misses are rewritten to.
-static void RunCacheMissedKeys(const bool cache_missed_keys) {
+// auto-insert, caching missed keys (Config::cache_missed_keys, or set_cache_missed_keys when
+// `via_config` is false) decides whether the missing keys were cached under their own key (so a
+// second lookup resolves every key from the cache) or dropped. Either way the backing table never
+// receives them: it holds its 16 keys plus the invalid key that misses are rewritten to.
+static void RunCacheMissedKeys(const bool cache_missed_keys, const bool via_config = false) {
   cudaGetLastError();
   using IndexT = int64_t;
   constexpr uint64_t row_size = 64;
@@ -1322,9 +1323,12 @@ static void RunCacheMissedKeys(const bool cache_missed_keys) {
   typename HierarchicalEmbeddingLayer<IndexT>::Config layer_cfg;
   layer_cfg.insert_heuristic = std::make_shared<TestInsertHeuristic>(std::vector<bool>{true, true});
   layer_cfg.default_embedding = std::vector<uint8_t>(row_size, default_byte);
+  layer_cfg.cache_missed_keys = via_config && cache_missed_keys;
   std::vector<table_ptr_t> tables{cache_tab, backing_tab};
   auto layer = std::make_shared<HierarchicalEmbeddingLayer<IndexT>>(layer_cfg, tables);
-  layer->set_cache_missed_keys(cache_missed_keys);
+  if (!via_config) {
+    layer->set_cache_missed_keys(cache_missed_keys);
+  }
   auto ctx = layer->create_execution_context(0, 0, nullptr, nullptr);
 
   std::vector<IndexT> keys(num_keys);
@@ -1368,6 +1372,12 @@ static void RunCacheMissedKeys(const bool cache_missed_keys) {
 
 TEST(HierachicalDefaultEmbedding, CacheMissedKeys) { RunCacheMissedKeys(true); }
 TEST(HierachicalDefaultEmbedding, MissedKeysNotCachedByDefault) { RunCacheMissedKeys(false); }
+TEST(HierachicalDefaultEmbedding, CacheMissedKeysFromConfig) {
+  RunCacheMissedKeys(true, true /*via_config*/);
+}
+TEST(HierachicalDefaultEmbedding, MissedKeysNotCachedByDefaultConfig) {
+  RunCacheMissedKeys(false, true /*via_config*/);
+}
 
 TEST(HierachicalDefaultEmbedding, CacheMissedKeysNeedsDefault) {
   cudaGetLastError();
@@ -1381,6 +1391,9 @@ TEST(HierachicalDefaultEmbedding, CacheMissedKeysNeedsDefault) {
   auto layer = std::make_shared<HierarchicalEmbeddingLayer<IndexT>>(layer_cfg, tables);
   EXPECT_ANY_THROW(layer->set_cache_missed_keys(true));
   EXPECT_NO_THROW(layer->set_cache_missed_keys(false));
+  // The config flag is checked at construction.
+  layer_cfg.cache_missed_keys = true;
+  EXPECT_ANY_THROW(std::make_shared<HierarchicalEmbeddingLayer<IndexT>>(layer_cfg, tables));
 }
 
 // Exercises HierarchicalEmbeddingLayer wrapping a single LinearHostTable — the

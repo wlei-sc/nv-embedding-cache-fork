@@ -188,6 +188,7 @@ PYBIND11_MODULE(nve, m) {
         .def_readwrite("default_row_index", &EmbedLayerConfig::default_row_index)
         .def_readwrite("default_embedding", &EmbedLayerConfig::default_embedding)
         .def_readwrite("disable_threadpool", &EmbedLayerConfig::disable_threadpool)
+        .def_readwrite("cache_missed_keys", &EmbedLayerConfig::cache_missed_keys)
         .def("to_json", [](const EmbedLayerConfig& c) {
             return nlohmann::json(c).dump();
         }, "Serialize the config to a JSON string.");

@@ -79,6 +79,8 @@ embedding = nve_layers.NVEmbedding(
 
 `disable_threadpool` (HostLayer only, default `False`) runs each lookup on the calling thread instead of handing it to the shared NVE thread pool.
 
+`cache_missed_keys` (Hierarchical only, default `False`) caches keys that are missing from every table: auto-insert stores them under their own key, with the `default_embedding` row, in the GPU and host caches, so later lookups of the same missing key are answered by the caches instead of the backing store (e.g. Redis). The backing store never receives them. Requires a non-empty `default_embedding`. A key that is later added to the backing store keeps returning the default row until its cache entry is evicted or erased.
+
 ## Using a Parameter Server
 To use the parameter server API, users are expected to implement the Table Interface defined in [table.hpp](../include/table.hpp) and provide a Python binding to it. See the [custom remote plugin](../samples/common/custom_remote_plugin/src/custom_remote_table.cpp) and [custom remote PS export sample](../samples/pytorch/export_sample/custom_remote_ps_export.py) for examples.
 
@@ -246,7 +248,8 @@ loader.reset();  // before dir releases its marker tensors
 Pass `LayerConfigOverrides` to tune layers without changing the export. Patches support
 `gpu_cache_size`, `host_cache_size`, `optimize_for_training`, and individual fields inside
 `config` (`logging_interval`, `kernel_mode`, `kernel_mode_value_1`, `kernel_mode_value_2`,
-`max_modify_size`, `default_row_index`, `default_embedding`, and `disable_threadpool`).
+`max_modify_size`, `default_row_index`, `default_embedding`, `disable_threadpool`, and
+`cache_missed_keys`).
 
 Precedence is **exported settings → defaults → per-layer patch**. Per-layer keys must match
 the exported `module_path` exactly; `""` addresses a root embedding. Unspecified fields are
@@ -270,6 +273,7 @@ Unsupported knobs are rejected even when their value is `0`, `false`, or an empt
 | `config.default_row_index` | LinearUVM, GPULayer |
 | `config.default_embedding` | HostLayer, Hierarchical |
 | `config.disable_threadpool` | HostLayer |
+| `config.cache_missed_keys` | Hierarchical |
 
 ```python
 from pynve.torch.nve_export import LayerConfigOverrides, load
