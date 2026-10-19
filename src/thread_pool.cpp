@@ -23,6 +23,35 @@
 
 namespace nve {
 
+namespace {
+
+// The pool the calling thread is a worker of; null on any other thread.
+thread_local const ThreadPool* t_worker_of{nullptr};
+
+// Runs a task submitted by one of the pool's own workers on that worker, before submit returns.
+// Queued instead, it could wait behind the very task that waits on it: once every worker waits
+// on nested work (execute_n), no worker is left to run it and the pool deadlocks.
+ThreadPool::result_type run_inline(ThreadPool::task_type task) {
+  ThreadPool::packaged_task_type packaged{std::move(task)};
+  ThreadPool::result_type res{packaged.get_future()};
+  packaged();  // a throw lands in `res`, as on a worker
+  return res;
+}
+
+int64_t run_inline_n(int64_t task_idx, const int64_t num_tasks,
+                     const ThreadPool::indexed_task_type& task, ThreadPool::result_type* results) {
+  for (int64_t i{}; i < num_tasks; ++i) {
+    ThreadPool::packaged_task_type packaged{std::bind(task, task_idx++)};
+    if (results) {
+      results[i] = packaged.get_future();
+    }
+    packaged();
+  }
+  return task_idx;
+}
+
+}  // namespace
+
 void from_json(const nlohmann::json& json, ThreadPoolConfig& conf) { NVE_READ_JSON_FIELD_(name); }
 
 void to_json(nlohmann::json& json, const ThreadPoolConfig& conf) {
@@ -191,6 +220,9 @@ SimpleThreadPool::~SimpleThreadPool() {
 ThreadPool::result_type SimpleThreadPool::submit(task_type task, const int64_t workgroup) {
   NVE_CHECK_(workgroup == 0, "`workgroup` is out of range!");
   NVE_CHECK_(!workers_.empty(), "ThreadPool `", name, "` is shutting down.");
+  if (t_worker_of == this) {
+    return run_inline(std::move(task));
+  }
 
   result_type res;
   {
@@ -209,6 +241,9 @@ int64_t SimpleThreadPool::submit_n(int64_t task_idx, const int64_t num_tasks,
   if (num_tasks <= 0) return task_idx;
   NVE_CHECK_(workgroup == 0, "`workgroup` is out of range!");
   NVE_CHECK_(!workers_.empty(), "ThreadPool `", name, "` is shutting down.");
+  if (t_worker_of == this) {
+    return run_inline_n(task_idx, num_tasks, task, results);
+  }
 
   {
     std::lock_guard lk(tasks_guard_);
@@ -234,6 +269,7 @@ int64_t SimpleThreadPool::submit_n(int64_t task_idx, const int64_t num_tasks,
 void SimpleThreadPool::worker_main_(const int64_t worker_idx) {
   // Make thread identifyable at OS level.
   this_thread_name() = to_string(name, "/w", worker_idx);
+  t_worker_of = this;
 
   auto& tasks_guard{tasks_guard_};
   auto& tasks{tasks_};
@@ -383,6 +419,9 @@ NumaThreadPool::~NumaThreadPool() {
 ThreadPool::result_type NumaThreadPool::submit(task_type task, int64_t workgroup) {
   NVE_CHECK_(workgroup >= 0 && workgroup < num_workgroups(), "`workgroup` is out of range!");
   NVE_CHECK_(!workers_.empty(), "ThreadPool `", name, "` is shutting down.");
+  if (t_worker_of == this) {
+    return run_inline(std::move(task));
+  }
 
   result_type res;
   {
@@ -402,6 +441,9 @@ int64_t NumaThreadPool::submit_n(int64_t task_idx, const int64_t num_tasks,
   if (num_tasks <= 0) return task_idx;
   NVE_CHECK_(workgroup >= 0 && workgroup < num_workgroups(), "`workgroup` is out of range!");
   NVE_CHECK_(!workers_.empty(), "ThreadPool `", name, "` is shutting down.");
+  if (t_worker_of == this) {
+    return run_inline_n(task_idx, num_tasks, task, results);
+  }
 
   {
     std::lock_guard lk(tasks_guards_[to_uint(workgroup)]);
@@ -428,6 +470,7 @@ void NumaThreadPool::worker_main_(const uint64_t workgroup_idx, const int64_t wo
   // Select desired NUMA node, and make thread identifyable at OS level.
   bind_thread_to_numa_node(numa_node_idx);
   this_thread_name() = to_string(name, "/g", workgroup_idx, "/w", worker_idx, "/n", numa_node_idx);
+  t_worker_of = this;
 
   auto& tasks_guard{tasks_guards_[workgroup_idx]};
   auto& tasks{tasks_[workgroup_idx]};

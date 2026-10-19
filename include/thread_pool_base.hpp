@@ -88,6 +88,11 @@ struct ThreadPoolConfig {
  *
  * Thread pools may group workers into workgroups. How they do that is implementation-dependent.
  * Workgroups are numbered from 0 to num_workgroups() - 1.
+ *
+ * Work submitted by one of the pool's own workers (a task that calls submit or execute_n on its
+ * pool, as the host tables' insert and find do under an auto-insert) runs on that worker before
+ * submit returns. Queued instead, it could wait behind the very task that waits on it: once every
+ * worker waits on nested work, no worker is left to run it and the pool deadlocks.
  */
 class ThreadPool {
  public:
