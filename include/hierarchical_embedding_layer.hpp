@@ -91,9 +91,39 @@ class HierarchicalEmbeddingLayer : public EmbeddingLayerBase {
    */
   void set_cache_missed_keys(bool enable);
 
+  /**
+   * An asynchronous lookup in three calls on one context, one lookup in flight per context.
+   * Same results and same cache fill as lookup(); only where the host work runs changes:
+   * - lookup_async_begin: on the lookup stream, the GPU table's find and the copy of the keys and
+   *   GPU hit mask to the host. A thread-pool task then runs the other tables' finds and the
+   *   default rows on host memory; besides waiting for that copy it makes no CUDA calls.
+   * - lookup_async_complete: waits for the task, then queues on the lookup stream the scatter of
+   *   the rows the GPU table missed into `output`, and a copy of `output` for the cache fill.
+   * - lookup_async_finish: once the lookup stream has passed complete, runs the cache fill from
+   *   that copy and reports per-table hit rates (as lookup()'s `hitrates`) and stats. Must follow
+   *   every begin, also when complete was skipped or threw: it then only waits for the task.
+   * Requires supports_async_lookup(). No pooling, no output hit mask.
+   *
+   * With `defer_last_table`, the task skips the last table (the backing store), so a caller can
+   * fetch for several layers at once: lookup_async_deferred waits for the task and hands over that
+   * table's find on the task's host buffers, whose unresolved rows already hold the default row;
+   * the caller writes the rows it finds and sets their hit bits, then passes how many it found to
+   * lookup_async_complete.
+   */
+  bool supports_async_lookup() const;
+  void lookup_async_begin(context_ptr_t& ctx, int64_t num_keys, const void* keys, void* output,
+                          int64_t output_stride, bool defer_last_table = false);
+  AsyncDeferredFind lookup_async_deferred(context_ptr_t& ctx);
+  void lookup_async_complete(context_ptr_t& ctx, int64_t deferred_hits = 0);
+  void lookup_async_finish(context_ptr_t& ctx, float* hitrates, AsyncLookupStats* stats);
+
   inline const Config& get_config() const { return config_; }
 
  private:
+  // The async lookup's thread-pool task: the host tables' and backing store's finds (the backing
+  // store's unless deferred), then the default rows, all on the host copies.
+  void run_async_host_stage(HierarchicalAsyncLookup& lookup) const;
+
   const Config config_;
   allocator_ptr_t allocator_;
   std::vector<table_ptr_t> tables_;
