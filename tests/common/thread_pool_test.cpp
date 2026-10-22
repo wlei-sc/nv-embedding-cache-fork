@@ -489,3 +489,78 @@ TEST(NumaThreadPool, NestedExecuteOnEveryWorker) {
     ]
   })"_json));
 }
+
+// The same, through the workgroup-spreading execute_n overload the host tables call
+// (`execute_n(0, num_parts, f, config.workgroups, 1)`), on a pool with two workgroups: with more
+// than one, that overload queues per workgroup and waits itself, outside the virtual execute_n.
+TEST(NumaThreadPool, NestedWorkgroupExecuteOnEveryWorker) {
+  const thread_pool_ptr_t tp{create_thread_pool(R"({
+    "implementation": "numa",
+    "workgroups": [
+      {"cpu_socket_index": -1, "numa_node_index": 0, "num_workers": 2},
+      {"cpu_socket_index": -1, "numa_node_index": 0, "num_workers": 2}
+    ]
+  })"_json)};
+  const int64_t workers{tp->num_workers()};
+  const std::vector<int64_t> workgroups{0, 1};
+  std::atomic<int64_t> started{0};
+  std::atomic<int64_t> inner{0};
+  RunWithin(20s, "a nested workgroup execute_n on every worker", [&] {
+    std::vector<ThreadPool::result_type> outer;
+    for (int64_t i{}; i < workers; ++i) {
+      outer.push_back(tp->submit(
+          [&] {
+            started++;
+            while (started.load() < workers) std::this_thread::yield();
+            tp->execute_n(0, 4, [&](int64_t) { inner++; }, workgroups, 1);
+          },
+          i % tp->num_workgroups()));
+    }
+    for (auto& res : outer) res.get();
+  });
+  EXPECT_EQ(inner, 4 * workers);
+}
+
+// A worker's fire-and-forget submit_n (as GpuTable::update_accumulate's launcher task does) is
+// queued for the other workers, not run inside the call: each task waits for the submitting task
+// to get past submit_n, which it could not if submit_n ran it.
+TEST(SimpleThreadPool, FireAndForgetFromWorkerIsQueued) {
+  const thread_pool_ptr_t tp{create_thread_pool(R"({"name": "tp", "num_workers": 4})"_json)};
+  constexpr int64_t kTasks{3};
+  std::atomic<bool> submitted{false};
+  std::atomic<int64_t> ran_after_submit{0};
+  std::atomic<int64_t> done{0};
+  RunWithin(20s, "a fire-and-forget submit_n from a worker", [&] {
+    tp->submit([&] {
+        tp->submit_n(0, kTasks, [&](int64_t) {
+          const auto deadline{std::chrono::steady_clock::now() + 2s};
+          while (!submitted.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+          }
+          if (submitted.load()) ran_after_submit++;
+          done++;
+        });
+        submitted = true;
+      }).get();
+    while (done.load() < kTasks) std::this_thread::yield();
+  });
+  EXPECT_EQ(ran_after_submit, kTasks) << "submit_n ran the tasks inside the call";
+}
+
+// A nested execute_n that runs inline still runs every task when one throws, and rethrows the
+// first error, as awaiting queued tasks would.
+TEST(SimpleThreadPool, NestedExecuteRunsEveryTaskAndRethrows) {
+  const thread_pool_ptr_t tp{create_thread_pool(R"({"name": "tp", "num_workers": 1})"_json)};
+  std::atomic<int64_t> ran{0};
+  RunWithin(20s, "a nested execute_n whose task throws", [&] {
+    tp->submit([&] {
+        EXPECT_THROW(tp->execute_n(0, 4,
+                                   [&](int64_t i) {
+                                     ran++;
+                                     if (i == 1) throw std::runtime_error("boom");
+                                   }),
+                     std::runtime_error);
+      }).get();
+  });
+  EXPECT_EQ(ran, 4);
+}
