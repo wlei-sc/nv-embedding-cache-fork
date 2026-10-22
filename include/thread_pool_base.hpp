@@ -88,6 +88,12 @@ struct ThreadPoolConfig {
  *
  * Thread pools may group workers into workgroups. How they do that is implementation-dependent.
  * Workgroups are numbered from 0 to num_workgroups() - 1.
+ *
+ * A blocking call (execute, execute_n) made by one of the pool's own workers runs its tasks on
+ * that worker. Queued instead, they could wait behind the very task that waits on them: once every
+ * worker waits on nested work, no worker is left to run it and the pool deadlocks. A worker's
+ * submit and submit_n still queue, because nothing waits on them inside the call; a worker that
+ * waits on such futures itself must not wait on work only this pool can run.
  */
 class ThreadPool {
  public:
@@ -116,6 +122,11 @@ class ThreadPool {
    * @return Number of distinct groups of workers.
    */
   virtual int64_t num_workgroups() const noexcept = 0;
+
+  /**
+   * @return Whether the calling thread is one of this pool's workers.
+   */
+  bool is_worker_thread() const noexcept;
 
   /**
    * Schedule a task for execution in the thread pool.
@@ -231,8 +242,10 @@ class ThreadPool {
                            const It& first_workgroup, const It& last_workgroup,
                            int64_t tasks_per_workgroup) {
     if (num_tasks <= 0) return task_idx;
-    // With a single workgroup there is nothing to distribute; use the (virtual) direct path.
-    if (num_workgroups() == 1) return execute_n(task_idx, num_tasks, task, 0);
+    // With a single workgroup there is nothing to distribute; use the (virtual) direct path. On
+    // one of this pool's own workers, too: spreading the tasks over the workgroups would queue
+    // work this worker then waits on, while the direct path runs them on this worker.
+    if (num_workgroups() == 1 || is_worker_thread()) return execute_n(task_idx, num_tasks, task, 0);
 
     static constexpr int64_t N{1024 / sizeof(result_type)};
     static_assert(N > 0);
@@ -267,6 +280,13 @@ class ThreadPool {
     return execute_n(task_idx, num_tasks, task, workgroups.begin(), workgroups.end(),
                      tasks_per_workgroup);
   }
+
+ protected:
+  /**
+   * Marks the calling thread as one of this pool's workers (see is_worker_thread). Each worker
+   * calls it before running its first task.
+   */
+  void mark_worker_thread() const noexcept;
 };
 
 }  // namespace nve

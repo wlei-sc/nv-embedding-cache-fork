@@ -106,6 +106,13 @@ class SimpleThreadPool final : public ThreadPool {
   int64_t submit_n(int64_t task_idx, int64_t num_tasks, const indexed_task_type& task,
                    result_type* results, int64_t workgroup) override;
 
+  // On one of this pool's own workers, the tasks run on that worker (see ThreadPool).
+  void execute(task_type task, int64_t workgroup) override;
+
+  using base_type::execute_n;
+  int64_t execute_n(int64_t task_idx, int64_t num_tasks, const indexed_task_type& task,
+                    int64_t workgroup) override;
+
  private:
   std::mutex tasks_guard_;
   task_queue_type tasks_;
@@ -174,6 +181,13 @@ class NumaThreadPool final : public ThreadPool {
 
   int64_t submit_n(int64_t task_idx, int64_t num_tasks, const indexed_task_type& task,
                    result_type* results, int64_t workgroup) override;
+
+  // On one of this pool's own workers, the tasks run on that worker (see ThreadPool).
+  void execute(task_type task, int64_t workgroup) override;
+
+  using base_type::execute_n;
+  int64_t execute_n(int64_t task_idx, int64_t num_tasks, const indexed_task_type& task,
+                    int64_t workgroup) override;
 
  private:
   std::vector<std::mutex> tasks_guards_;
