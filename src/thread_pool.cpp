@@ -16,12 +16,34 @@
  */
 
 #include <algorithm>
+#include <exception>
 #include <numa_support.hpp>
 #include <regex>
 #include <mutex>
 #include <thread_pool.hpp>
 
 namespace nve {
+
+namespace {
+
+// Runs tasks [task_idx, task_idx + num_tasks) on the calling thread: a blocking call made by one
+// of the pool's own workers (see ThreadPool). Every task runs even if one throws, and the first
+// exception is rethrown afterwards, as awaiting their futures in order would.
+int64_t execute_n_inline(int64_t task_idx, const int64_t num_tasks,
+                         const ThreadPool::indexed_task_type& task) {
+  std::exception_ptr first_error;
+  for (int64_t i{}; i < num_tasks; ++i, ++task_idx) {
+    try {
+      task(task_idx);
+    } catch (...) {
+      if (!first_error) first_error = std::current_exception();
+    }
+  }
+  if (first_error) std::rethrow_exception(first_error);
+  return task_idx;
+}
+
+}  // namespace
 
 void from_json(const nlohmann::json& json, ThreadPoolConfig& conf) { NVE_READ_JSON_FIELD_(name); }
 
@@ -231,9 +253,26 @@ int64_t SimpleThreadPool::submit_n(int64_t task_idx, const int64_t num_tasks,
   return task_idx;
 }
 
+void SimpleThreadPool::execute(task_type task, const int64_t workgroup) {
+  if (!is_worker_thread()) {
+    base_type::execute(std::move(task), workgroup);
+    return;
+  }
+  NVE_CHECK_(workgroup == 0, "`workgroup` is out of range!");
+  task();
+}
+
+int64_t SimpleThreadPool::execute_n(const int64_t task_idx, const int64_t num_tasks,
+                                    const indexed_task_type& task, const int64_t workgroup) {
+  if (!is_worker_thread()) return base_type::execute_n(task_idx, num_tasks, task, workgroup);
+  NVE_CHECK_(workgroup == 0, "`workgroup` is out of range!");
+  return execute_n_inline(task_idx, num_tasks, task);
+}
+
 void SimpleThreadPool::worker_main_(const int64_t worker_idx) {
   // Make thread identifyable at OS level.
   this_thread_name() = to_string(name, "/w", worker_idx);
+  mark_worker_thread();
 
   auto& tasks_guard{tasks_guard_};
   auto& tasks{tasks_};
@@ -423,11 +462,28 @@ int64_t NumaThreadPool::submit_n(int64_t task_idx, const int64_t num_tasks,
   return task_idx;
 }
 
+void NumaThreadPool::execute(task_type task, const int64_t workgroup) {
+  if (!is_worker_thread()) {
+    base_type::execute(std::move(task), workgroup);
+    return;
+  }
+  NVE_CHECK_(workgroup >= 0 && workgroup < num_workgroups(), "`workgroup` is out of range!");
+  task();
+}
+
+int64_t NumaThreadPool::execute_n(const int64_t task_idx, const int64_t num_tasks,
+                                  const indexed_task_type& task, const int64_t workgroup) {
+  if (!is_worker_thread()) return base_type::execute_n(task_idx, num_tasks, task, workgroup);
+  NVE_CHECK_(workgroup >= 0 && workgroup < num_workgroups(), "`workgroup` is out of range!");
+  return execute_n_inline(task_idx, num_tasks, task);
+}
+
 void NumaThreadPool::worker_main_(const uint64_t workgroup_idx, const int64_t worker_idx,
                                   const int64_t numa_node_idx) {
   // Select desired NUMA node, and make thread identifyable at OS level.
   bind_thread_to_numa_node(numa_node_idx);
   this_thread_name() = to_string(name, "/g", workgroup_idx, "/w", worker_idx, "/n", numa_node_idx);
+  mark_worker_thread();
 
   auto& tasks_guard{tasks_guards_[workgroup_idx]};
   auto& tasks{tasks_[workgroup_idx]};

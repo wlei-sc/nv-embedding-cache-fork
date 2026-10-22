@@ -30,8 +30,12 @@
 #include <host_table.hpp>
 #include <plugin/plugin_loader.hpp>
 #include <linear_host_table.hpp>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <optional>
 #include <numeric>
@@ -1688,6 +1692,99 @@ TEST(HierachicalHitrate, TierWithNoCandidatesReportsOneNotNaN) {
   // The caller-facing hit rates are relative to num_keys and unchanged: all hits in tier 0.
   EXPECT_FLOAT_EQ(hitrates.at(0), 1.f);
   EXPECT_FLOAT_EQ(hitrates.at(1), 0.f);
+  ctx.reset();
+}
+
+// Runs `f`, which must finish within `limit`. A deadlocked pool can't be unwound, so a hang is
+// reported and the test binary exits instead of hanging.
+template <typename F>
+static void RunWithin(const std::chrono::seconds limit, const char* what, F&& f) {
+  auto done{std::async(std::launch::async, std::forward<F>(f))};
+  if (done.wait_for(limit) != std::future_status::ready) {
+    std::fprintf(stderr, "DEADLOCK: %s did not finish within %lld s\n", what,
+                 static_cast<long long>(limit.count()));
+    std::fflush(stderr);
+    std::_Exit(1);
+  }
+  done.get();
+}
+
+// The host cache's auto-insert runs as a task on the layer's thread pool, and the NVHashMap insert
+// it calls fans out over that same pool (execute_n) and waits. On a one-worker pool the insert's
+// tasks queue behind the auto-insert itself, which holds the only worker: the auto-insert must
+// still finish, and the next lookup must hit the rows it inserted.
+TEST(HierachicalAutoInsert, HostCacheFillOnOneWorkerPool) {
+  using IndexT = int64_t;
+  constexpr int64_t kRowSize = 64;
+  constexpr int64_t kNumKeys = 2048;
+  cudaGetLastError();
+
+  GPUTableConfig gpu_cfg;
+  gpu_cfg.device_id = 0;
+  gpu_cfg.cache_size = 64 << 20;
+  gpu_cfg.max_modify_size = 1 << 20;
+  gpu_cfg.row_size_in_bytes = kRowSize;
+  gpu_cfg.uvm_table = nullptr;
+  gpu_cfg.value_dtype = DataType_t::Float32;
+  nlohmann::json nvhm_conf = {{"key_size", sizeof(IndexT)},
+                              {"max_value_size", kRowSize},
+                              {"value_dtype", "float32"},
+                              {"num_partitions", 2},
+                              {"initial_capacity", 1024},
+                              {"value_alignment", 32},
+                              {"overflow_policy",
+                               {{"overflow_margin", 1 << 16}, {"handler", "evict_lru"},
+                                {"resolution_margin", 0.5}}}};
+  HostTableConfig store_cfg;
+  store_cfg.value_dtype = DataType_t::Float32;
+  store_cfg.max_value_size = kRowSize;
+  std::vector<table_ptr_t> tables{
+      std::make_shared<GpuTable<IndexT>>(gpu_cfg),
+      table_factory_ptr_t{nve_test::plugin_factory("nvhm")}->produce(4730, nvhm_conf),
+      std::make_shared<MockHostTable<IndexT>>(store_cfg, true /*functional_ref*/)};
+
+  typename HierarchicalEmbeddingLayer<IndexT>::Config cfg;
+  // Only the host cache auto-inserts, as soon as it misses.
+  cfg.insert_heuristic = std::make_shared<TestInsertHeuristic>(std::vector<bool>{false, true, false});
+  cfg.min_insert_size_gpu = 1024;
+  cfg.min_insert_size_host = 0;
+  cfg.default_embedding = std::vector<uint8_t>(kRowSize, 0xAB);
+  auto layer = std::make_shared<HierarchicalEmbeddingLayer<IndexT>>(cfg, tables);
+  auto pool = create_thread_pool(nlohmann::json{{"name", "one_worker_tp"}, {"num_workers", 1}});
+  auto ctx = layer->create_execution_context(0, 0, pool, nullptr);
+
+  // The keys are only in the backing store.
+  std::vector<IndexT> keys(kNumKeys);
+  std::iota(keys.begin(), keys.end(), 0);
+  std::vector<uint8_t> values(kNumKeys * kRowSize);
+  for (size_t i = 0; i < values.size(); i++) values[i] = static_cast<uint8_t>((i * 7) % 251);
+  layer->insert(ctx, kNumKeys, keys.data(), kRowSize, kRowSize, values.data(), 2);
+  ctx->wait();
+
+  IndexT* d_keys = nullptr;
+  void* d_out = nullptr;
+  NVE_CHECK_(cudaMalloc(&d_keys, keys.size() * sizeof(IndexT)));
+  NVE_CHECK_(cudaMalloc(&d_out, values.size()));
+  NVE_CHECK_(cudaMemcpy(d_keys, keys.data(), keys.size() * sizeof(IndexT), cudaMemcpyDefault));
+
+  float first[3] = {};
+  RunWithin(std::chrono::seconds(20), "a lookup whose host-cache auto-insert runs on a one-worker pool",
+            [&] {
+              layer->lookup(ctx, kNumKeys, d_keys, d_out, kRowSize, nullptr, nullptr, first);
+              ctx->wait();  // reaps the auto-insert
+            });
+  EXPECT_EQ(first[1], 0.0f) << "the host cache starts empty";
+
+  float second[3] = {};
+  layer->lookup(ctx, kNumKeys, d_keys, d_out, kRowSize, nullptr, nullptr, second);
+  ctx->wait();
+  EXPECT_FLOAT_EQ(second[1], 1.0f) << "the auto-insert should have filled the host cache";
+  std::vector<uint8_t> out(values.size());
+  NVE_CHECK_(cudaMemcpy(out.data(), d_out, out.size(), cudaMemcpyDefault));
+  EXPECT_EQ(out, values);
+
+  NVE_CHECK_(cudaFree(d_keys));
+  NVE_CHECK_(cudaFree(d_out));
   ctx.reset();
 }
 
