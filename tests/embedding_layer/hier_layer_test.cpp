@@ -30,8 +30,12 @@
 #include <host_table.hpp>
 #include <plugin/plugin_loader.hpp>
 #include <linear_host_table.hpp>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <optional>
 #include <numeric>
@@ -1299,6 +1303,359 @@ TEST(HierachicalDefaultEmbedding, NoDefaultLeavesMissesUntouched) {
   }
 }
 
+// Two host tables, a cache in front of a backing table, with a default embedding and auto-insert
+// into both. Keys [0, 16) live in the backing table, [16, 32) nowhere. After one lookup and its
+// auto-insert, set_cache_missed_keys decides whether the missing keys were cached under their own
+// key (so a second lookup resolves every key from the cache) or dropped. Either way the backing
+// table never receives them: it holds its 16 keys plus the invalid key that misses are rewritten to.
+static void RunCacheMissedKeys(const bool cache_missed_keys) {
+  cudaGetLastError();
+  using IndexT = int64_t;
+  constexpr uint64_t row_size = 64;
+  constexpr uint64_t num_keys = 32;
+  constexpr uint64_t num_stored = 16;
+  constexpr uint8_t default_byte = 0xAB;
+  constexpr uint8_t stored_byte = 0x42;
+
+  HostTableConfig host_cfg;
+  host_cfg.value_dtype = DataType_t::Float32;
+  host_cfg.max_value_size = static_cast<int64_t>(row_size);
+  auto cache_tab = std::make_shared<MockHostTable<IndexT>>(host_cfg, true /*functional_ref*/);
+  auto backing_tab = std::make_shared<MockHostTable<IndexT>>(host_cfg, true /*functional_ref*/);
+
+  typename HierarchicalEmbeddingLayer<IndexT>::Config layer_cfg;
+  layer_cfg.insert_heuristic = std::make_shared<TestInsertHeuristic>(std::vector<bool>{true, true});
+  layer_cfg.default_embedding = std::vector<uint8_t>(row_size, default_byte);
+  std::vector<table_ptr_t> tables{cache_tab, backing_tab};
+  auto layer = std::make_shared<HierarchicalEmbeddingLayer<IndexT>>(layer_cfg, tables);
+  layer->set_cache_missed_keys(cache_missed_keys);
+  auto ctx = layer->create_execution_context(0, 0, nullptr, nullptr);
+
+  std::vector<IndexT> keys(num_keys);
+  for (uint64_t i = 0; i < num_keys; i++) keys[i] = static_cast<IndexT>(i);
+  std::vector<uint8_t> stored(num_stored * row_size, stored_byte);
+  layer->insert(ctx, static_cast<int64_t>(num_stored), keys.data(), static_cast<int64_t>(row_size),
+                static_cast<int64_t>(row_size), stored.data(), 1 /*table_id: backing*/);
+  ctx->wait();
+
+  std::vector<uint8_t> output(num_keys * row_size);
+  std::vector<bitmask64_t> hitmask(ceil_div(num_keys, to_uint(bitmask64::num_bits)));
+  float hitrates[2] = {};
+  const auto lookup = [&] {
+    std::fill(output.begin(), output.end(), uint8_t{0});
+    std::fill(hitmask.begin(), hitmask.end(), bitmask64_t{0});
+    layer->lookup(ctx, static_cast<int64_t>(num_keys), keys.data(), output.data(),
+                  static_cast<int64_t>(row_size), hitmask.data(), nullptr /*pool_params*/, hitrates);
+    ctx->wait();  // also waits for the auto-insert
+  };
+  lookup();
+
+  context_ptr_t no_ctx;
+  const int64_t cached = cache_tab->size(no_ctx, false) / static_cast<int64_t>(row_size);
+  const int64_t backing = backing_tab->size(no_ctx, false) / static_cast<int64_t>(row_size);
+  EXPECT_EQ(cached, cache_missed_keys ? int64_t{num_keys} : int64_t{num_stored + 1});
+  EXPECT_EQ(backing, int64_t{num_stored + 1});
+
+  lookup();
+  EXPECT_FLOAT_EQ(hitrates[0], cache_missed_keys ? 1.0f : 0.5f);
+  EXPECT_FLOAT_EQ(hitrates[1], 0.0f);
+  for (uint64_t i = 0; i < num_keys; i++) {
+    const auto mask{hitmask[i / to_uint(bitmask64::num_bits)]};
+    const bool hit{bitmask64::get(mask, static_cast<int64_t>(i) % bitmask64::num_bits)};
+    ASSERT_EQ(hit, i < num_stored || cache_missed_keys) << "key " << i;
+    const uint8_t expected = (i < num_stored) ? stored_byte : default_byte;
+    for (uint64_t j = 0; j < row_size; j++) {
+      ASSERT_EQ(expected, output[i * row_size + j]) << "key " << i << " byte " << j;
+    }
+  }
+}
+
+TEST(HierachicalDefaultEmbedding, CacheMissedKeys) { RunCacheMissedKeys(true); }
+TEST(HierachicalDefaultEmbedding, MissedKeysNotCachedByDefault) { RunCacheMissedKeys(false); }
+
+TEST(HierachicalDefaultEmbedding, CacheMissedKeysNeedsDefault) {
+  cudaGetLastError();
+  using IndexT = int64_t;
+  HostTableConfig host_cfg;
+  host_cfg.value_dtype = DataType_t::Float32;
+  host_cfg.max_value_size = 32;
+  std::vector<table_ptr_t> tables{std::make_shared<MockHostTable<IndexT>>(host_cfg, true),
+                                  std::make_shared<MockHostTable<IndexT>>(host_cfg, true)};
+  typename HierarchicalEmbeddingLayer<IndexT>::Config layer_cfg;  // no default_embedding
+  auto layer = std::make_shared<HierarchicalEmbeddingLayer<IndexT>>(layer_cfg, tables);
+  EXPECT_ANY_THROW(layer->set_cache_missed_keys(true));
+  EXPECT_NO_THROW(layer->set_cache_missed_keys(false));
+}
+
+// One GPU cache -> NVHashMap host cache -> mock backing store layer, filled the same way every
+// time, for comparing lookup() with lookup_async_*. The host cache has two partitions, so its
+// find fans out through execute_n, which the async task must run inline.
+struct AsyncTwin {
+  using IndexT = int64_t;
+  static constexpr int64_t kRowSize = 64;
+
+  std::shared_ptr<HierarchicalEmbeddingLayer<IndexT>> layer;
+  context_ptr_t ctx;
+
+  // inserts[i]: whether table i auto-inserts (GPU cache, host cache, backing store).
+  explicit AsyncTwin(int64_t host_table_id, std::vector<bool> inserts = {true, true, false}) {
+    GPUTableConfig gpu_cfg;
+    gpu_cfg.device_id = 0;
+    gpu_cfg.cache_size = 64 << 20;
+    gpu_cfg.max_modify_size = 1 << 20;
+    gpu_cfg.row_size_in_bytes = kRowSize;
+    gpu_cfg.uvm_table = nullptr;
+    gpu_cfg.value_dtype = DataType_t::Float32;
+    nlohmann::json nvhm_conf = {{"key_size", sizeof(IndexT)},
+                                {"max_value_size", kRowSize},
+                                {"value_dtype", "float32"},
+                                {"num_partitions", 2},
+                                {"initial_capacity", 1024},
+                                {"value_alignment", 32},
+                                {"overflow_policy",
+                                 {{"overflow_margin", 1 << 16}, {"handler", "evict_lru"},
+                                  {"resolution_margin", 0.5}}}};
+    HostTableConfig remote_cfg;
+    remote_cfg.value_dtype = DataType_t::Float32;
+    remote_cfg.max_value_size = kRowSize;
+    std::vector<table_ptr_t> tables{
+        std::make_shared<GpuTable<IndexT>>(gpu_cfg),
+        table_factory_ptr_t{nve_test::plugin_factory("nvhm")}->produce(host_table_id, nvhm_conf),
+        std::make_shared<MockHostTable<IndexT>>(remote_cfg, true /*functional_ref*/)};
+
+    typename HierarchicalEmbeddingLayer<IndexT>::Config cfg;
+    cfg.insert_heuristic = std::make_shared<TestInsertHeuristic>(std::move(inserts));
+    cfg.min_insert_size_gpu = 1024;
+    cfg.min_insert_size_host = 0;
+    cfg.default_embedding = std::vector<uint8_t>(kRowSize, 0xAB);
+    layer = std::make_shared<HierarchicalEmbeddingLayer<IndexT>>(cfg, tables);
+    ctx = layer->create_execution_context(0, 0, nullptr, nullptr);
+
+    // Backing store [0, 4000), host cache [1000, 1500), GPU cache [500, 800), each with values
+    // that tell the tiers apart.
+    insert_range(2, 0, 4000, 3);
+    insert_range(1, 1000, 1500, 2);
+    insert_range(0, 500, 800, 1);
+  }
+
+  void insert_range(int64_t table_id, IndexT lo, IndexT hi, uint8_t tier) {
+    std::vector<IndexT> keys;
+    std::vector<uint8_t> values;
+    for (IndexT k = lo; k < hi; k++) {
+      keys.push_back(k);
+      for (int64_t j = 0; j < kRowSize; j++) {
+        values.push_back(static_cast<uint8_t>((k * 7 + j * 3 + tier * 31) % 251));
+      }
+    }
+    layer->insert(ctx, static_cast<int64_t>(keys.size()), keys.data(), kRowSize, kRowSize,
+                  values.data(), table_id);
+    ctx->wait();
+  }
+};
+
+// Keys that hit each tier, keys missing everywhere (default rows), in a fixed scrambled order.
+static std::vector<int64_t> async_round_keys(int round) {
+  std::vector<int64_t> keys;
+  for (int64_t k = 0; k < 4000; k += 2) keys.push_back(k + round % 2);  // every tier
+  for (int64_t k = 9000; k < 9300; k++) keys.push_back(k + 100 * round);  // missing everywhere
+  for (size_t i = 0; i < keys.size(); i++) std::swap(keys[i], keys[(i * 7919) % keys.size()]);
+  return keys;
+}
+
+TEST(HierachicalAsync, MatchesSyncLookup) {
+  cudaGetLastError();
+  AsyncTwin sync_twin(4716);
+  AsyncTwin async_twin(4717);
+  ASSERT_TRUE(async_twin.layer->supports_async_lookup());
+  constexpr int64_t row = AsyncTwin::kRowSize;
+
+  for (int round = 0; round < 3; round++) {
+    const std::vector<int64_t> keys = async_round_keys(round);
+    const auto n = static_cast<int64_t>(keys.size());
+    int64_t* d_keys = nullptr;
+    void* d_out_sync = nullptr;
+    void* d_out_async = nullptr;
+    NVE_CHECK_(cudaMalloc(&d_keys, keys.size() * sizeof(int64_t)));
+    NVE_CHECK_(cudaMalloc(&d_out_sync, keys.size() * row));
+    NVE_CHECK_(cudaMalloc(&d_out_async, keys.size() * row));
+    NVE_CHECK_(cudaMemcpy(d_keys, keys.data(), keys.size() * sizeof(int64_t), cudaMemcpyDefault));
+
+    float sync_rates[3] = {};
+    sync_twin.layer->lookup(sync_twin.ctx, n, d_keys, d_out_sync, row, nullptr, nullptr, sync_rates);
+    sync_twin.ctx->wait();
+
+    float async_rates[3] = {};
+    AsyncLookupStats stats;
+    async_twin.layer->lookup_async_begin(async_twin.ctx, n, d_keys, d_out_async, row);
+    async_twin.layer->lookup_async_complete(async_twin.ctx);
+    NVE_CHECK_(cudaStreamSynchronize(0));
+    async_twin.layer->lookup_async_finish(async_twin.ctx, async_rates, &stats);
+    async_twin.ctx->wait();
+
+    std::vector<uint8_t> out_sync(keys.size() * row), out_async(keys.size() * row);
+    NVE_CHECK_(cudaMemcpy(out_sync.data(), d_out_sync, out_sync.size(), cudaMemcpyDefault));
+    NVE_CHECK_(cudaMemcpy(out_async.data(), d_out_async, out_async.size(), cudaMemcpyDefault));
+    EXPECT_EQ(out_sync, out_async) << "round " << round;
+    for (int t = 0; t < 3; t++) {
+      EXPECT_EQ(sync_rates[t], async_rates[t]) << "round " << round << " table " << t;
+    }
+    if (round == 0) {
+      // Later rounds repeat keys the fills have since cached.
+      EXPECT_GT(sync_rates[2], 0.0f) << "the backing store should be reached";
+    }
+    EXPECT_EQ(stats.find_ns.size(), 3u);
+    NVE_CHECK_(cudaFree(d_keys));
+    NVE_CHECK_(cudaFree(d_out_sync));
+    NVE_CHECK_(cudaFree(d_out_async));
+  }
+}
+
+// The caller resolves the backing store's keys itself (as a fetch fused across layers would), from
+// the values AsyncTwin inserted there: outputs and hit rates must still match lookup().
+TEST(HierachicalAsync, DeferredLastTableMatchesSyncLookup) {
+  cudaGetLastError();
+  AsyncTwin sync_twin(4719);
+  AsyncTwin async_twin(4720);
+  constexpr int64_t row = AsyncTwin::kRowSize;
+
+  for (int round = 0; round < 3; round++) {
+    const std::vector<int64_t> keys = async_round_keys(round);
+    const auto n = static_cast<int64_t>(keys.size());
+    int64_t* d_keys = nullptr;
+    void* d_out_sync = nullptr;
+    void* d_out_async = nullptr;
+    NVE_CHECK_(cudaMalloc(&d_keys, keys.size() * sizeof(int64_t)));
+    NVE_CHECK_(cudaMalloc(&d_out_sync, keys.size() * row));
+    NVE_CHECK_(cudaMalloc(&d_out_async, keys.size() * row));
+    NVE_CHECK_(cudaMemcpy(d_keys, keys.data(), keys.size() * sizeof(int64_t), cudaMemcpyDefault));
+
+    float sync_rates[3] = {};
+    sync_twin.layer->lookup(sync_twin.ctx, n, d_keys, d_out_sync, row, nullptr, nullptr, sync_rates);
+    sync_twin.ctx->wait();
+
+    float async_rates[3] = {};
+    AsyncLookupStats stats;
+    async_twin.layer->lookup_async_begin(async_twin.ctx, n, d_keys, d_out_async, row,
+                                         true /*defer_last_table*/);
+    const AsyncDeferredFind find = async_twin.layer->lookup_async_deferred(async_twin.ctx);
+    ASSERT_EQ(find.num_keys, n);
+    ASSERT_EQ(find.value_size, row);
+    const auto* find_keys = static_cast<const int64_t*>(find.keys);
+    auto* find_rows = static_cast<uint8_t*>(find.values);
+    int64_t found = 0;
+    for (int64_t i = 0; i < n; i++) {
+      const int64_t k = find_keys[i];
+      if (bitmask64::get(find.hit_mask[i / bitmask64::num_bits], i % bitmask64::num_bits) ||
+          k < 0 || k >= 4000) {
+        continue;  // resolved above, or not in the backing store: keeps the default row
+      }
+      for (int64_t j = 0; j < row; j++) {
+        find_rows[i * find.value_stride + j] = static_cast<uint8_t>((k * 7 + j * 3 + 3 * 31) % 251);
+      }
+      find.hit_mask[i / bitmask64::num_bits] |= bitmask64::single(i % bitmask64::num_bits);
+      found++;
+    }
+    async_twin.layer->lookup_async_complete(async_twin.ctx, found);
+    NVE_CHECK_(cudaStreamSynchronize(0));
+    async_twin.layer->lookup_async_finish(async_twin.ctx, async_rates, &stats);
+    async_twin.ctx->wait();
+
+    std::vector<uint8_t> out_sync(keys.size() * row), out_async(keys.size() * row);
+    NVE_CHECK_(cudaMemcpy(out_sync.data(), d_out_sync, out_sync.size(), cudaMemcpyDefault));
+    NVE_CHECK_(cudaMemcpy(out_async.data(), d_out_async, out_async.size(), cudaMemcpyDefault));
+    EXPECT_EQ(out_sync, out_async) << "round " << round;
+    for (int t = 0; t < 3; t++) {
+      EXPECT_EQ(sync_rates[t], async_rates[t]) << "round " << round << " table " << t;
+    }
+    if (round == 0) {
+      EXPECT_GT(found, 0) << "the caller should resolve some keys";
+    }
+    EXPECT_EQ(stats.find_ns.at(2), 0) << "the deferred table's find must not run";
+    NVE_CHECK_(cudaFree(d_keys));
+    NVE_CHECK_(cudaFree(d_out_sync));
+    NVE_CHECK_(cudaFree(d_out_async));
+  }
+}
+
+// With cache_missed_keys, an async lookup's fill caches the keys missing everywhere, with the
+// default row, in each tier that inserts: a second lookup of only those keys resolves all of them
+// from that tier. Only `tier` inserts, so the result is that tier's alone.
+static void RunAsyncCachesMissedKeys(const int tier) {
+  cudaGetLastError();
+  AsyncTwin twin(4721 + tier, {tier == 0, tier == 1, false});
+  twin.layer->set_cache_missed_keys(true);
+  constexpr int64_t row = AsyncTwin::kRowSize;
+  const auto lookup = [&](const std::vector<int64_t>& keys, float* rates) {
+    const auto n = static_cast<int64_t>(keys.size());
+    int64_t* d_keys = nullptr;
+    void* d_out = nullptr;
+    NVE_CHECK_(cudaMalloc(&d_keys, keys.size() * sizeof(int64_t)));
+    NVE_CHECK_(cudaMalloc(&d_out, keys.size() * row));
+    NVE_CHECK_(cudaMemcpy(d_keys, keys.data(), keys.size() * sizeof(int64_t), cudaMemcpyDefault));
+    AsyncLookupStats stats;
+    twin.layer->lookup_async_begin(twin.ctx, n, d_keys, d_out, row);
+    twin.layer->lookup_async_complete(twin.ctx);
+    NVE_CHECK_(cudaStreamSynchronize(0));
+    twin.layer->lookup_async_finish(twin.ctx, rates, &stats);
+    twin.ctx->wait();  // also waits for the fill's inserts
+    std::vector<uint8_t> out(keys.size() * row);
+    NVE_CHECK_(cudaMemcpy(out.data(), d_out, out.size(), cudaMemcpyDefault));
+    NVE_CHECK_(cudaFree(d_keys));
+    NVE_CHECK_(cudaFree(d_out));
+    return out;
+  };
+  // Every tier plus keys [9000, 9300) missing everywhere: 2300 keys, past min_insert_size_gpu.
+  float rates[3] = {};
+  lookup(async_round_keys(0), rates);
+  std::vector<int64_t> missing;
+  for (int64_t k = 9000; k < 9300; k++) missing.push_back(k);
+  const std::vector<uint8_t> out = lookup(missing, rates);
+  EXPECT_FLOAT_EQ(rates[tier], 1.0f) << "tier " << tier;
+  EXPECT_FLOAT_EQ(rates[2], 0.0f) << "the backing store must not be asked again";
+  for (size_t i = 0; i < out.size(); i++) {
+    ASSERT_EQ(out[i], 0xAB) << "key " << missing[i / row] << " byte " << i % row;
+  }
+}
+
+TEST(HierachicalAsync, CachesMissedKeysInTheGpuCache) { RunAsyncCachesMissedKeys(0); }
+TEST(HierachicalAsync, CachesMissedKeysInTheHostCache) { RunAsyncCachesMissedKeys(1); }
+
+TEST(HierachicalAsync, FinishWithoutCompleteJoinsAndResets) {
+  cudaGetLastError();
+  AsyncTwin twin(4718);
+  constexpr int64_t row = AsyncTwin::kRowSize;
+  const std::vector<int64_t> keys = async_round_keys(0);
+  const auto n = static_cast<int64_t>(keys.size());
+  int64_t* d_keys = nullptr;
+  void* d_out = nullptr;
+  NVE_CHECK_(cudaMalloc(&d_keys, keys.size() * sizeof(int64_t)));
+  NVE_CHECK_(cudaMalloc(&d_out, keys.size() * row));
+  NVE_CHECK_(cudaMemcpy(d_keys, keys.data(), keys.size() * sizeof(int64_t), cudaMemcpyDefault));
+
+  // An aborted batch: begin, then finish without complete. It must join and allow a new begin.
+  twin.layer->lookup_async_begin(twin.ctx, n, d_keys, d_out, row);
+  EXPECT_NO_THROW(twin.layer->lookup_async_finish(twin.ctx, nullptr, nullptr));
+  float rates[3] = {};
+  twin.layer->lookup_async_begin(twin.ctx, n, d_keys, d_out, row);
+  EXPECT_THROW(twin.layer->lookup_async_begin(twin.ctx, n, d_keys, d_out, row), std::exception);
+  twin.layer->lookup_async_complete(twin.ctx);
+  NVE_CHECK_(cudaStreamSynchronize(0));
+  twin.layer->lookup_async_finish(twin.ctx, rates, nullptr);
+  EXPECT_FLOAT_EQ(rates[0] + rates[1] + rates[2] + 300.0f / static_cast<float>(n), 1.0f);
+  twin.ctx->wait();
+  NVE_CHECK_(cudaFree(d_keys));
+  NVE_CHECK_(cudaFree(d_out));
+
+  // Host-only layers can't run async: there is no GPU table to resolve first.
+  HostTableConfig host_cfg;
+  host_cfg.value_dtype = DataType_t::Float32;
+  host_cfg.max_value_size = row;
+  typename HierarchicalEmbeddingLayer<int64_t>::Config cfg;
+  HierarchicalEmbeddingLayer<int64_t> host_only(
+      cfg, {std::make_shared<MockHostTable<int64_t>>(host_cfg, true)});
+  EXPECT_FALSE(host_only.supports_async_lookup());
+}
+
 // Exercises HierarchicalEmbeddingLayer wrapping a single LinearHostTable — the
 // configuration that backs the Python HostLayer binding.
 TEST(HierachicalLinearHost, LookupReadsHostBuffer) {
@@ -1688,6 +2045,99 @@ TEST(HierachicalHitrate, TierWithNoCandidatesReportsOneNotNaN) {
   // The caller-facing hit rates are relative to num_keys and unchanged: all hits in tier 0.
   EXPECT_FLOAT_EQ(hitrates.at(0), 1.f);
   EXPECT_FLOAT_EQ(hitrates.at(1), 0.f);
+  ctx.reset();
+}
+
+// Runs `f`, which must finish within `limit`. A deadlocked pool can't be unwound, so a hang is
+// reported and the test binary exits instead of hanging.
+template <typename F>
+static void RunWithin(const std::chrono::seconds limit, const char* what, F&& f) {
+  auto done{std::async(std::launch::async, std::forward<F>(f))};
+  if (done.wait_for(limit) != std::future_status::ready) {
+    std::fprintf(stderr, "DEADLOCK: %s did not finish within %lld s\n", what,
+                 static_cast<long long>(limit.count()));
+    std::fflush(stderr);
+    std::_Exit(1);
+  }
+  done.get();
+}
+
+// The host cache's auto-insert runs as a task on the layer's thread pool, and the NVHashMap insert
+// it calls fans out over that same pool (execute_n) and waits. On a one-worker pool the insert's
+// tasks queue behind the auto-insert itself, which holds the only worker: the auto-insert must
+// still finish, and the next lookup must hit the rows it inserted.
+TEST(HierachicalAutoInsert, HostCacheFillOnOneWorkerPool) {
+  using IndexT = int64_t;
+  constexpr int64_t kRowSize = 64;
+  constexpr int64_t kNumKeys = 2048;
+  cudaGetLastError();
+
+  GPUTableConfig gpu_cfg;
+  gpu_cfg.device_id = 0;
+  gpu_cfg.cache_size = 64 << 20;
+  gpu_cfg.max_modify_size = 1 << 20;
+  gpu_cfg.row_size_in_bytes = kRowSize;
+  gpu_cfg.uvm_table = nullptr;
+  gpu_cfg.value_dtype = DataType_t::Float32;
+  nlohmann::json nvhm_conf = {{"key_size", sizeof(IndexT)},
+                              {"max_value_size", kRowSize},
+                              {"value_dtype", "float32"},
+                              {"num_partitions", 2},
+                              {"initial_capacity", 1024},
+                              {"value_alignment", 32},
+                              {"overflow_policy",
+                               {{"overflow_margin", 1 << 16}, {"handler", "evict_lru"},
+                                {"resolution_margin", 0.5}}}};
+  HostTableConfig store_cfg;
+  store_cfg.value_dtype = DataType_t::Float32;
+  store_cfg.max_value_size = kRowSize;
+  std::vector<table_ptr_t> tables{
+      std::make_shared<GpuTable<IndexT>>(gpu_cfg),
+      table_factory_ptr_t{nve_test::plugin_factory("nvhm")}->produce(4730, nvhm_conf),
+      std::make_shared<MockHostTable<IndexT>>(store_cfg, true /*functional_ref*/)};
+
+  typename HierarchicalEmbeddingLayer<IndexT>::Config cfg;
+  // Only the host cache auto-inserts, as soon as it misses.
+  cfg.insert_heuristic = std::make_shared<TestInsertHeuristic>(std::vector<bool>{false, true, false});
+  cfg.min_insert_size_gpu = 1024;
+  cfg.min_insert_size_host = 0;
+  cfg.default_embedding = std::vector<uint8_t>(kRowSize, 0xAB);
+  auto layer = std::make_shared<HierarchicalEmbeddingLayer<IndexT>>(cfg, tables);
+  auto pool = create_thread_pool(nlohmann::json{{"name", "one_worker_tp"}, {"num_workers", 1}});
+  auto ctx = layer->create_execution_context(0, 0, pool, nullptr);
+
+  // The keys are only in the backing store.
+  std::vector<IndexT> keys(kNumKeys);
+  std::iota(keys.begin(), keys.end(), 0);
+  std::vector<uint8_t> values(kNumKeys * kRowSize);
+  for (size_t i = 0; i < values.size(); i++) values[i] = static_cast<uint8_t>((i * 7) % 251);
+  layer->insert(ctx, kNumKeys, keys.data(), kRowSize, kRowSize, values.data(), 2);
+  ctx->wait();
+
+  IndexT* d_keys = nullptr;
+  void* d_out = nullptr;
+  NVE_CHECK_(cudaMalloc(&d_keys, keys.size() * sizeof(IndexT)));
+  NVE_CHECK_(cudaMalloc(&d_out, values.size()));
+  NVE_CHECK_(cudaMemcpy(d_keys, keys.data(), keys.size() * sizeof(IndexT), cudaMemcpyDefault));
+
+  float first[3] = {};
+  RunWithin(std::chrono::seconds(20), "a lookup whose host-cache auto-insert runs on a one-worker pool",
+            [&] {
+              layer->lookup(ctx, kNumKeys, d_keys, d_out, kRowSize, nullptr, nullptr, first);
+              ctx->wait();  // reaps the auto-insert
+            });
+  EXPECT_EQ(first[1], 0.0f) << "the host cache starts empty";
+
+  float second[3] = {};
+  layer->lookup(ctx, kNumKeys, d_keys, d_out, kRowSize, nullptr, nullptr, second);
+  ctx->wait();
+  EXPECT_FLOAT_EQ(second[1], 1.0f) << "the auto-insert should have filled the host cache";
+  std::vector<uint8_t> out(values.size());
+  NVE_CHECK_(cudaMemcpy(out.data(), d_out, out.size(), cudaMemcpyDefault));
+  EXPECT_EQ(out, values);
+
+  NVE_CHECK_(cudaFree(d_keys));
+  NVE_CHECK_(cudaFree(d_out));
   ctx.reset();
 }
 

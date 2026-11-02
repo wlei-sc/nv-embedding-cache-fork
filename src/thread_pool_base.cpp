@@ -20,6 +20,17 @@
 
 namespace nve {
 
+namespace {
+
+// The pool the calling thread is a worker of; null on any other thread.
+thread_local const ThreadPool* t_worker_of{nullptr};
+
+}  // namespace
+
+bool ThreadPool::is_worker_thread() const noexcept { return t_worker_of == this; }
+
+void ThreadPool::mark_worker_thread() const noexcept { t_worker_of = this; }
+
 void ThreadPoolConfig::check() const {
   static const std::regex name_pattern{R"(^[\w\d]+$)"};
   NVE_CHECK_(std::regex_match(name, name_pattern));

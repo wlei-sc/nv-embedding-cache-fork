@@ -146,6 +146,12 @@ struct RedisClusterTableFactoryConfig final : public HostTableFactoryConfig {
   std::string server_name_identification{
       "redis.localhost"};  // SNI to request (can deviate from connection address).
 
+  // Timeouts in milliseconds; 0 (the default) waits forever, as before. Last, so positional
+  // initializers of the fields above keep working.
+  int64_t connect_timeout_ms{0};    // Establishing a connection.
+  int64_t socket_timeout_ms{0};     // Each read or write on a connection (bounds a command).
+  int64_t pool_wait_timeout_ms{0};  // Waiting for a free connection when all are in use.
+
   void check() const;
 };
 
